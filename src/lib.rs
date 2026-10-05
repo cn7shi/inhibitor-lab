@@ -2,6 +2,49 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::{self, BufRead};
 
+pub mod pi;
+
+/// Provider-independent facts. Failure is reported by the tool, not inferred from text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentEvent {
+    ToolCompleted {
+        tool_call_id: String,
+        tool_name: String,
+        failed: bool,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EventFilter {
+    kind: EventKind,
+    failed: bool,
+    tool_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum EventKind {
+    ToolCompleted,
+}
+
+impl EventFilter {
+    fn accepts(&self, event: &AgentEvent) -> bool {
+        match (&self.kind, event) {
+            (
+                EventKind::ToolCompleted,
+                AgentEvent::ToolCompleted {
+                    tool_name, failed, ..
+                },
+            ) => {
+                *failed == self.failed
+                    && self.tool_name.as_ref().is_none_or(|name| name == tool_name)
+            }
+        }
+    }
+}
+
 /// One observed stream. Stderr does not inherently mean failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -40,7 +83,8 @@ struct Rule {
     id: String,
     #[serde(default)]
     source: SourceFilter,
-    contains: String,
+    contains: Option<String>,
+    event: Option<EventFilter>,
     threshold: u64,
 }
 
@@ -53,8 +97,27 @@ struct RuleState {
 #[derive(Debug, Serialize)]
 pub struct Trigger {
     pub rule_id: String,
-    pub matched_lines: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_lines: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_events: Option<u64>,
     pub threshold: u64,
+}
+
+impl RuleState {
+    fn record_match(&mut self) -> Option<Trigger> {
+        self.matches += 1;
+        if self.matches < self.rule.threshold {
+            return None;
+        }
+        self.fired = true;
+        Some(Trigger {
+            rule_id: self.rule.id.clone(),
+            matched_lines: self.rule.contains.as_ref().map(|_| self.matches),
+            matched_events: self.rule.event.as_ref().map(|_| self.matches),
+            threshold: self.rule.threshold,
+        })
+    }
 }
 
 pub struct RuleEngine {
@@ -69,9 +132,18 @@ impl RuleEngine {
             if rule.id.trim().is_empty() || !ids.insert(rule.id.clone()) {
                 return Err("rule ids must be nonempty and unique".into());
             }
-            if rule.contains.is_empty() || rule.threshold == 0 {
+            if rule.contains.is_some() == rule.event.is_some()
+                || rule.contains.as_ref().is_some_and(String::is_empty)
+                || rule.event.as_ref().is_some_and(|filter| {
+                    filter
+                        .tool_name
+                        .as_ref()
+                        .is_some_and(|name| name.trim().is_empty())
+                })
+                || rule.threshold == 0
+            {
                 return Err(format!(
-                    "rule {} requires nonempty contains and threshold >= 1",
+                    "rule {} requires exactly one of nonempty contains or event, and threshold >= 1",
                     rule.id
                 ));
             }
@@ -95,18 +167,40 @@ impl RuleEngine {
         for state in &mut self.states {
             if state.fired
                 || !state.rule.source.accepts(source)
-                || !line.contains(&state.rule.contains)
+                || !state
+                    .rule
+                    .contains
+                    .as_ref()
+                    .is_some_and(|text| line.contains(text))
             {
                 continue;
             }
-            state.matches += 1;
-            if state.matches >= state.rule.threshold {
-                state.fired = true;
-                triggers.push(Trigger {
-                    rule_id: state.rule.id.clone(),
-                    matched_lines: state.matches,
-                    threshold: state.rule.threshold,
-                });
+            if let Some(trigger) = state.record_match() {
+                triggers.push(trigger);
+            }
+        }
+        triggers
+    }
+
+    pub fn requires_agent_events(&self) -> bool {
+        self.states.iter().any(|state| state.rule.event.is_some())
+    }
+
+    pub fn observe_event(&mut self, source: Source, event: &AgentEvent) -> Vec<Trigger> {
+        let mut triggers = Vec::new();
+        for state in &mut self.states {
+            if state.fired
+                || !state.rule.source.accepts(source)
+                || !state
+                    .rule
+                    .event
+                    .as_ref()
+                    .is_some_and(|filter| filter.accepts(event))
+            {
+                continue;
+            }
+            if let Some(trigger) = state.record_match() {
+                triggers.push(trigger);
             }
         }
         triggers
@@ -165,7 +259,10 @@ mod tests {
         assert!(engine.observe(Source::Stdout, "ERROR").is_empty());
         assert!(engine.observe(Source::Stderr, "ERROR ERROR").is_empty());
         assert!(engine.observe(Source::Stderr, "error").is_empty());
-        assert_eq!(engine.observe(Source::Stderr, "ERROR")[0].matched_lines, 2);
+        assert_eq!(
+            engine.observe(Source::Stderr, "ERROR")[0].matched_lines,
+            Some(2)
+        );
         assert!(engine.observe(Source::Stderr, "ERROR").is_empty());
     }
 
@@ -176,9 +273,48 @@ mod tests {
             r#"{"rules":[{"id":"a","contains":"","threshold":1}]}"#,
             r#"{"rules":[{"id":"a","contains":"x","threshold":1},{"id":"a","contains":"y","threshold":1}]}"#,
             r#"{"rules":[{"id":"a","contains":"x","threshold":1,"typo":true}]}"#,
+            r#"{"rules":[{"id":"a","threshold":1}]}"#,
+            r#"{"rules":[{"id":"a","contains":"x","event":{"kind":"tool_completed","failed":true},"threshold":1}]}"#,
+            r#"{"rules":[{"id":"a","event":{"kind":"tool_completed","failed":"true"},"threshold":1}]}"#,
         ] {
             assert!(RuleEngine::from_json(input).is_err());
         }
+    }
+
+    #[test]
+    fn event_rule_counts_failures_only_and_keeps_text_rules_separate() {
+        let mut engine = RuleEngine::from_json(
+            r#"{"rules":[{"id":"failures","event":{"kind":"tool_completed","failed":true,"tool_name":"read"},"threshold":2}]}"#,
+        ).unwrap();
+        let event = |name: &str, failed| AgentEvent::ToolCompleted {
+            tool_call_id: "call".into(),
+            tool_name: name.into(),
+            failed,
+        };
+        assert!(engine.observe(Source::Stdout, "ERROR").is_empty());
+        assert!(
+            engine
+                .observe_event(Source::Stdout, &event("read", false))
+                .is_empty()
+        );
+        assert!(
+            engine
+                .observe_event(Source::Stdout, &event("bash", true))
+                .is_empty()
+        );
+        assert!(
+            engine
+                .observe_event(Source::Stdout, &event("read", true))
+                .is_empty()
+        );
+        let triggers = engine.observe_event(Source::Stdout, &event("read", true));
+        assert_eq!(triggers[0].matched_events, Some(2));
+        assert_eq!(triggers[0].matched_lines, None);
+        assert!(
+            engine
+                .observe_event(Source::Stdout, &event("read", true))
+                .is_empty()
+        );
     }
 
     #[test]

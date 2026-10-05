@@ -1,0 +1,11 @@
+{
+  "name": "inhibitor-lab-pi-experiment",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check:local": "node check-local.mjs"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.0.3"
+  }
+}

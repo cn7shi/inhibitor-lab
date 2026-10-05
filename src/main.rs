@@ -1,4 +1,4 @@
-use inhibitor_lab::{RuleEngine, Source, read_line_bounded};
+use inhibitor_lab::{RuleEngine, Source, Trigger, pi::PiAdapter, read_line_bounded};
 use serde_json::{Value, json};
 use std::env;
 use std::ffi::OsString;
@@ -10,12 +10,13 @@ use std::sync::mpsc::{SyncSender, sync_channel};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const HELP: &str = "inhibitor-lab: capture process output and emit explicit rule triggers\n\nUsage:\n  inhibitor-lab run --rules <rules.json> [--out <events.jsonl>] -- <program> [args...]\n\nRules use case-sensitive substring matching. Triggers are recorded only; the child keeps running.\nLogs default to runs/<run-id>.jsonl. Existing output files are never overwritten.";
+const HELP: &str = "inhibitor-lab: capture process output and emit explicit rule triggers\n\nUsage:\n  inhibitor-lab run --rules <rules.json> [--format text|pi-json] [--out <events.jsonl>] -- <program> [args...]\n\nText rules match case-sensitive substrings. Pi JSON mode also normalizes tool results.\nTriggers are recorded only; the child keeps running. Malformed Pi stdout records cause exit 2 after capture.\nLogs default to runs/<run-id>.jsonl. Existing output files are never overwritten.";
 
 struct Options {
     rules: PathBuf,
     output: Option<PathBuf>,
     command: Vec<OsString>,
+    pi_json: bool,
 }
 
 fn parse_options() -> Result<Option<Options>, String> {
@@ -28,6 +29,7 @@ fn parse_options() -> Result<Option<Options>, String> {
     }
     let mut rules = None;
     let mut output = None;
+    let mut format = None;
     while let Some(arg) = args.next() {
         if arg == "--" {
             let command: Vec<_> = args.collect();
@@ -38,7 +40,19 @@ fn parse_options() -> Result<Option<Options>, String> {
                 rules: rules.ok_or("--rules is required")?,
                 output,
                 command,
+                pi_json: format.unwrap_or(false),
             }));
+        }
+        if arg == "--format" {
+            if format.is_some() {
+                return Err("duplicate option: --format".into());
+            }
+            format = Some(match args.next().as_deref() {
+                Some(value) if value == "text" => false,
+                Some(value) if value == "pi-json" => true,
+                _ => return Err("--format requires text or pi-json".into()),
+            });
+            continue;
         }
         let target = if arg == "--rules" {
             &mut rules
@@ -86,6 +100,29 @@ impl Journal {
     }
 }
 
+fn record_triggers(
+    journal: &mut Journal,
+    triggers: Vec<Trigger>,
+    sequence: u64,
+) -> io::Result<usize> {
+    let count = triggers.len();
+    for trigger in triggers {
+        journal.emit(
+            "rule_triggered",
+            json!({"trigger": trigger, "matched_event_sequence": sequence, "action": "record"}),
+        )?;
+        eprintln!(
+            "[inhibitor-lab] rule triggered: {} ({} matches)",
+            trigger.rule_id,
+            trigger
+                .matched_events
+                .or(trigger.matched_lines)
+                .unwrap_or_default()
+        );
+    }
+    Ok(count)
+}
+
 enum Capture {
     Line(Source, String, bool),
     Error(Source, String),
@@ -123,6 +160,11 @@ impl Drop for ManagedChild {
 
 fn run(options: Options) -> Result<i32, Box<dyn std::error::Error>> {
     let mut rules = RuleEngine::from_json(&fs::read_to_string(&options.rules)?)?;
+    if rules.requires_agent_events() && !options.pi_json {
+        return Err("event rules require --format pi-json".into());
+    }
+    let mut adapter = options.pi_json.then(PiAdapter::default);
+    let mut adapter_complete = true;
     let run_id = format!("{}-{}", now_ms(), std::process::id());
     let output = options
         .output
@@ -158,7 +200,7 @@ fn run(options: Options) -> Result<i32, Box<dyn std::error::Error>> {
     };
     journal.emit(
         "run_started",
-        json!({"program": program.to_string_lossy(), "pid": child.0.id()}),
+        json!({"program": program.to_string_lossy(), "pid": child.0.id(), "format": if options.pi_json { "pi-json" } else { "text" }}),
     )?;
     let stdout = child.0.stdout.take().ok_or("missing stdout pipe")?;
     let stderr = child.0.stderr.take().ok_or("missing stderr pipe")?;
@@ -185,15 +227,32 @@ fn run(options: Options) -> Result<i32, Box<dyn std::error::Error>> {
                     Source::Stderr => writeln!(io::stderr().lock(), "{display_text}")?,
                 }
                 if truncated {
+                    if options.pi_json && source == Source::Stdout {
+                        adapter_complete = false;
+                        journal.emit("adapter_error", json!({"adapter": "pi", "raw_event_sequence": sequence, "error": "truncated Pi record; skipped"}))?;
+                    }
                     continue;
                 }
-                for trigger in rules.observe(source, &text) {
-                    journal.emit("rule_triggered", json!({"trigger": trigger, "matched_event_sequence": sequence, "action": "record"}))?;
-                    eprintln!(
-                        "[inhibitor-lab] rule triggered: {} ({} matching lines)",
-                        trigger.rule_id, trigger.matched_lines
-                    );
-                    trigger_count += 1;
+                trigger_count +=
+                    record_triggers(&mut journal, rules.observe(source, &text), sequence)?;
+                if source == Source::Stdout
+                    && let Some(adapter) = &mut adapter
+                {
+                    match adapter.observe(&text) {
+                        Ok(Some(event)) => {
+                            let normalized = journal.emit("agent_event", json!({"adapter": "pi", "raw_event_sequence": sequence, "event": event}))?;
+                            trigger_count += record_triggers(
+                                &mut journal,
+                                rules.observe_event(source, &event),
+                                normalized,
+                            )?;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            adapter_complete = false;
+                            journal.emit("adapter_error", json!({"adapter": "pi", "raw_event_sequence": sequence, "error": error}))?;
+                        }
+                    }
                 }
             }
             Capture::Error(source, error) => {
@@ -209,8 +268,11 @@ fn run(options: Options) -> Result<i32, Box<dyn std::error::Error>> {
         }
     }
     let status = child.0.wait()?;
-    journal.emit("run_finished", json!({"exit_code": status.code(), "success": status.success(), "trigger_count": trigger_count, "capture_complete": !capture_failed}))?;
-    Ok(if capture_failed {
+    journal.emit("run_finished", json!({"exit_code": status.code(), "success": status.success(), "trigger_count": trigger_count, "capture_complete": !capture_failed, "adapter_complete": adapter_complete}))?;
+    if !adapter_complete {
+        eprintln!("[inhibitor-lab] Pi input was incomplete or invalid; see adapter_error events");
+    }
+    Ok(if capture_failed || !adapter_complete {
         2
     } else {
         status.code().unwrap_or(1)

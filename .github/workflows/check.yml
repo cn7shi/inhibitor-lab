@@ -14,3 +14,11 @@ jobs:
       - run: cargo +stable fmt --check
       - run: cargo +stable test --locked
       - run: cargo +stable clippy --locked --all-targets -- -D warnings
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: integrations/pi/package-lock.json
+      - run: npm ci --prefix integrations/pi --ignore-scripts --no-audit --no-fund
+      - run: cargo +stable build --locked --bins
+      - run: npm --prefix integrations/pi run check:local

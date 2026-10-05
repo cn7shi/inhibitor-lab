@@ -23,6 +23,26 @@ fn main() {
             print!("final line without newline");
             io::stdout().flush().unwrap();
         }
+        scenario @ ("pi" | "pi-malformed") => {
+            println!(r#"{{"type":"session","id":"test"}}"#);
+            if scenario == "pi-malformed" {
+                println!("invalid protocol line");
+            }
+            // Neither ordinary result text nor JSON on stderr is a failed tool event.
+            println!(
+                r#"{{"type":"tool_execution_end","toolCallId":"ok","toolName":"read","isError":false,"result":{{"content":[{{"text":"ERROR"}}]}}}}"#
+            );
+            eprintln!(
+                r#"{{"type":"tool_execution_end","toolCallId":"stderr","toolName":"read","isError":true}}"#
+            );
+            for id in ["first", "first", "second", "third"] {
+                println!(
+                    "{}",
+                    serde_json::json!({"type":"tool_execution_end", "toolCallId":id, "toolName":"read", "isError":true})
+                );
+            }
+            println!(r#"{{"type":"agent_settled"}}"#);
+        }
         other => {
             eprintln!("unknown scenario: {other}; use normal, repeat, fail, or long-line");
             std::process::exit(2);

@@ -1,0 +1,9 @@
+{
+  "rules": [
+    {
+      "id": "two-tool-failures",
+      "event": { "kind": "tool_completed", "failed": true },
+      "threshold": 2
+    }
+  ]
+}
