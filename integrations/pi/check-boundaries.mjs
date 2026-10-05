@@ -8,6 +8,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { captureOutput } from "./capture-output.mjs";
 import { stopRun } from "./process-cleanup.mjs";
+import { checkRecovery } from "./check-recovery.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, "../..");
@@ -197,6 +198,14 @@ async function runCase(scenario, action) {
     assert.equal(inspection.triggers[0].evidence_sequence, triggers[0].data.matched_event_sequence);
     assert.deepEqual(await readFile(journal), journalBytes, "Inspection must preserve the original log bytes");
     await writeFile(join(run, "inspection.json"), `${JSON.stringify(inspection, null, 2)}\n`);
+    const requestsBeforeRecovery = requests.length;
+    const recovery = block ? await checkRecovery(launcher, journal, run, {
+      schema_version: 1, reason: "R2: review a fresh task after the parent gate closed.",
+      prompt: "Run the next isolated fixture only after a future explicit start step.",
+      rules: join(root, "examples/pi-rules.json"), cwd, program: process.execPath,
+      args: args.slice(args.indexOf("--") + 2), timeout_ms: 20000, control_timeout_ms: 5000,
+    }) : null;
+    assert.equal(requests.length, requestsBeforeRecovery, "R2 must not make additional model requests");
     const summary = {
       pi_version: version, node_version: process.version, scenario, action,
       model_mode: "local-deterministic-fixture", real_model_validated: false, artificial_delay_ms: 0,
@@ -204,6 +213,7 @@ async function runCase(scenario, action) {
       trigger_sequence: triggers[0].sequence, evidence_sequence: triggers[0].data.matched_event_sequence,
       decisions: decisions.map((e) => ({ sequence: e.sequence, ...e.data })), parent_links: parentLinks,
       eligible_for_manual_restart: inspection.eligible_for_manual_restart,
+      recovery,
     };
     await writeFile(join(run, "summary.json"), `${JSON.stringify(summary, null, 2)}\n`);
     console.log(JSON.stringify({ ...summary, evidence_directory: run }, null, 2));

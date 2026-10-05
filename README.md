@@ -2,7 +2,7 @@
 
 本地 Agent 错误治理的独立实验工程，使用 Rust 从头搭建。
 
-首次阅读或交接给其他 Agent，请先看 [项目导读与源码教程](tutorial.md)：项目意图、演进理由、七课阅读路线、证据解释与人工恢复设计都从这一个文件进入。
+首次阅读或交接给其他 Agent，请先看 [项目导读与源码教程](tutorial.md)：项目意图、演进理由、八课阅读路线、证据解释与人工恢复设计都从这一个文件进入。
 
 当前阶段验证：**启动进程 → 获取输出 → 转换工具结果 → 匹配显式规则 → 记录触发 → 可选 Pi RPC 中止或工具准入拦截**。
 
@@ -17,6 +17,7 @@
 - 写入逐行 JSON 事件，保留运行 ID、事件序号、采集时间和触发依据。
 - 观察模式让子进程继续运行并保留其退出码；RPC 模式额外记录控制结果。
 - 只读诊断已有日志，关联触发、准入决定、应用确认与收尾，说明是否满足后续人工继续的日志条件。
+- 为合格父运行准备新任务配置，经明确确认保存唯一的待启动关联；新进程启动尚未接入。
 
 规则完全由配置决定；`stderr` 本身不代表错误。当前不判断错误语义。Pi RPC 可请求中止，配合自有扩展可关闭新工具准入；已经放行的并发工具不能撤销。尚不提供重试、人工恢复或上下文修复。
 
@@ -31,9 +32,22 @@
 .\target\debug\inhibitor-lab.exe inspect --log runs/<某次实验>/events.jsonl --format json
 ```
 
-默认中文摘要，显示规则、阈值、证据序号、门是否关闭、确认拒绝数和退出完整性。JSON 字段 `eligible_for_manual_restart` 仅表示日志满足首版继续条件；还没有实现人工确认及 `resume`。本命令不修改日志、不启动 Agent、不执行日志里的程序名。
+默认中文摘要，显示规则、阈值、证据序号、门是否关闭、确认拒绝数和退出完整性。JSON 字段 `eligible_for_manual_restart` 仅表示日志满足首版继续条件，后续需单独准备和确认；`resume` 启动尚未实现。本命令不修改日志、不启动 Agent、不执行日志里的程序名。
 
 `inspect` 返回 0 表示诊断有效，即使 record / abort 等不满足继续条件；损坏、未知版本、未结束、超限或读取失败返回 2。不能用退出 0 代替人工许可。限额为 32 MiB 文件、1 MiB 单行、100,000 条记录；较早日志缺少关键字段也会明确拒绝。详见 [诊断验证与限制](docs/verification/inspect.md)。
+
+## 准备下一次运行并确认
+
+先按需要调整 [新任务配置示例](examples/recovery-config.example.json) 的原因、任务和路径。示例使用本机 Scoop Node 路径；相对 `rules` / `cwd` / `program` 以配置文件所在目录解析。若把配置另存到 `runs/`，应相应调整这些路径或使用绝对路径；个人配置、计划和确认记录建议放在忽略目录 `runs/`。
+
+```powershell
+.\target\debug\inhibitor-lab.exe recovery prepare --parent runs/<父实验>/events.jsonl --config examples/recovery-config.example.json --out runs/recovery-plan.json
+.\target\debug\inhibitor-lab.exe recovery confirm --plan runs/recovery-plan.json
+```
+
+确认界面展示父运行原因、新任务、规则、目录、程序参数和预留运行 ID。输入显示的 `CONFIRM recovery-...` 并换行后，保存 `recovery-plan.json.confirmed.json`，状态为 **已确认、尚未启动**。取消 / EOF 返回 3；文件或内容无效、变化、重复确认返回 2；准备 / 确认保存成功返回 0。
+
+父日志不改，计划和确认文件不覆盖。父日志、配置、规则、计划均绑定摘要；在查看期间变化会使确认失效。计划复制 / 改名不可直接复用，同一计划并发确认仅一份成功。下一阶段启动前仍须复核并单独占用启动记录；本阶段没有实际创建新 Agent。详见 [R2 验证及限制](docs/verification/recovery-prepare.md)。
 
 ## Pi 本地验证（不需要模型账号）
 
@@ -211,10 +225,10 @@ npm --prefix integrations/pi run check:gate
 npm --prefix integrations/pi run check:boundaries
 ```
 
-43 项 Rust 测试覆盖文本采集、规则、Pi 结果去重、损坏输入、证据关联，以及 RPC 控制、准入确认、关闭后请求重放、异常响应、超时、退出、竞态记录和只读诊断的伪证据 / 截断 / 时序回归；14 项 Node 测试检查进程清理、输出写入失败、超时、错误保留及扩展拒绝行为（含并发迟到批准）。`check:local`、`check:rpc`、`check:gate` 和 `check:boundaries` 启动真实 Pi 验证观察、中止及准入边界；最后一个脚本还验证只读诊断和原日志字节不变。Windows CI 执行全部验证。
+54 项 Rust 测试覆盖文本采集、规则、Pi 适配、RPC / 准入、诊断，以及人工准备 / 确认中的取消、变化、身份关联、并发唯一性与无执行副作用；14 项 Node 测试检查进程清理、输出写入失败、超时、错误保留及扩展拒绝行为（含并发迟到批准）。`check:local`、`check:rpc`、`check:gate` 和 `check:boundaries` 启动真实 Pi 验证观察、中止及准入边界；最后一个脚本还验证只读诊断和两份父运行的 R2 确认链，独立重算摘要并检查原文不变。Windows CI 执行全部验证。
 
 ## 后续实验
 
 1. 配置用户选择的模型服务，验证真实模型运行时的事件。
-2. 按 [导读中的人工恢复方案](tutorial.md) 实现新配置确认和关联的新运行；只读 `inspect` 已完成，R2–R4 尚未实现。限制提前放行的调度策略另行评估。
+2. 按 [导读中的人工恢复方案](tutorial.md) 接入 R3 启动消费、新进程及关联日志，再做 R4 两轮验证；R1 诊断和 R2 准备 / 确认已完成。限制提前放行的调度策略另行评估。
 3. 增加本地日志来源与 MCP 观测，处理不同来源之间的重复事件。

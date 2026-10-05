@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "reason": "已检查父运行的失败原因，准备从新的只读任务继续",
+  "prompt": "只读检查项目结构，报告接下来需要人工处理的问题",
+  "rules": "pi-rules.json",
+  "cwd": "..",
+  "program": "D:/DevEnvironment/scoop/apps/nodejs-lts/current/node.exe",
+  "args": [
+    "integrations/pi/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
+    "--mode", "rpc",
+    "--offline",
+    "--no-extensions",
+    "--no-skills",
+    "--no-prompt-templates",
+    "--no-session",
+    "--tools", "read",
+    "--extension", "integrations/pi/tool-gate.js"
+  ],
+  "timeout_ms": 30000,
+  "control_timeout_ms": 5000
+}

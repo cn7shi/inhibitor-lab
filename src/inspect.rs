@@ -4,8 +4,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
-use std::fs::File;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 const MAX_BYTES: u64 = 32 * 1024 * 1024;
@@ -112,24 +110,8 @@ fn raw(events: &[Event], at: usize, data: &Value) -> Check<Value> {
         .map_err(|_| "原始 Pi 证据不是有效 JSON".into())
 }
 
-fn load(path: &Path) -> Check<Vec<Event>> {
-    let mut file = File::open(path).map_err(|_| "无法打开日志文件".to_owned())?;
-    let before = file.metadata().map_err(|_| "无法读取文件元数据")?;
-    require(before.is_file(), "仅支持普通日志文件")?;
-    require(before.len() <= MAX_BYTES, "日志超过 32 MiB 上限")?;
-    let mut bytes = Vec::new();
-    (&mut file)
-        .take(MAX_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| "读取日志失败")?;
-    let after = file.metadata().map_err(|_| "无法复核文件元数据")?;
-    require(bytes.len() as u64 <= MAX_BYTES, "日志超过 32 MiB 上限")?;
-    require(
-        before.len() == after.len()
-            && before.len() == bytes.len() as u64
-            && before.modified().ok() == after.modified().ok(),
-        "日志在读取期间变化，请待运行结束后重试",
-    )?;
+fn load(path: &Path) -> Check<(Vec<Event>, String)> {
+    let bytes = crate::evidence_file::read(path, MAX_BYTES)?;
     require(!bytes.is_empty(), "日志为空")?;
     require(
         bytes.last() == Some(&b'\n'),
@@ -158,7 +140,37 @@ fn load(path: &Path) -> Check<Vec<Event>> {
         let _ = event.at_unix_ms;
         events.push(event);
     }
-    Ok(events)
+    Ok((events, crate::evidence_file::digest(&bytes)))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ParentEvidence {
+    pub run_id: String,
+    pub sha256: String,
+    pub triggers: Vec<Value>,
+    pub gate_closed_sequence: u64,
+    pub confirmed_blocked_tools: u64,
+    pub finish: Value,
+}
+
+/// The diagnosis and hash refer to the very same bounded read, not two file opens.
+pub(super) fn recovery_snapshot(path: &Path) -> Check<ParentEvidence> {
+    let (events, sha256) = load(path)?;
+    let mut report = Report::default();
+    validate(&events, &mut report)?;
+    require(
+        report.eligible_for_manual_restart,
+        "父日志不满足人工继续条件，请先运行 inspect 核对",
+    )?;
+    Ok(ParentEvidence {
+        run_id: report.run_id.ok_or("父运行身份缺失")?,
+        sha256,
+        triggers: report.triggers,
+        gate_closed_sequence: report.gate_closed_sequence.ok_or("父运行关闭证据缺失")?,
+        confirmed_blocked_tools: report.confirmed_blocked_tools,
+        finish: report.finish.ok_or("父运行终态缺失")?,
+    })
 }
 
 struct Decision<'a> {
@@ -658,7 +670,7 @@ fn validate(events: &[Event], report: &mut Report) -> Check<()> {
 
 fn inspect(path: &Path) -> Report {
     let mut report = Report::default();
-    if let Err(error) = load(path).and_then(|events| validate(&events, &mut report)) {
+    if let Err(error) = load(path).and_then(|(events, _)| validate(&events, &mut report)) {
         report.status = "invalid";
         report.eligible_for_manual_restart = false;
         report.reasons.push(error);

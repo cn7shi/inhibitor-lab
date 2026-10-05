@@ -12,8 +12,10 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod control;
+mod evidence_file;
 mod gate;
 mod inspect;
+mod recovery;
 use control::{Action, RpcControl};
 
 const HELP: &str = r#"inhibitor-lab: capture process output and emit explicit rule triggers
@@ -21,9 +23,13 @@ const HELP: &str = r#"inhibitor-lab: capture process output and emit explicit ru
 Usage:
   inhibitor-lab run --rules <rules.json> [--format text|pi-json|pi-rpc] [--out <events.jsonl>] -- <program> [args...]
   inhibitor-lab inspect --log <events.jsonl> [--format text|json]
+  inhibitor-lab recovery prepare --parent <events.jsonl> --config <new-run.json> --out <plan.json>
+  inhibitor-lab recovery confirm --plan <plan.json>
 
 Inspect is read-only. Exit 0 means a valid diagnostic, not permission to restart.
 Invalid/incomplete/unsupported logs return 2. No resume command is implemented yet.
+Recovery prepare/confirm save a plan and one confirmed-not-started receipt; neither starts a child.
+Recovery exit 0 means saved, 3 means cancelled, 2 means invalid, changed, or already confirmed.
 
 RPC options (pi-rpc only):
   --prompt <text>                 Required single prompt sent over stdin
@@ -56,7 +62,7 @@ fn parse_options() -> Result<Option<Options>, String> {
         None => return Ok(None),
         Some(value) if value == "--help" || value == "-h" => return Ok(None),
         Some(value) if value == "run" => {}
-        _ => return Err("expected run or inspect; use --help".into()),
+        _ => return Err("expected run, inspect or recovery; use --help".into()),
     }
     let mut rules = None;
     let mut output = None;
@@ -576,8 +582,15 @@ fn run(options: Options) -> Result<i32, Box<dyn std::error::Error>> {
 }
 
 fn main() {
-    if env::args_os().nth(1).is_some_and(|arg| arg == "inspect") {
-        match inspect::command(env::args_os().skip(2)) {
+    if let Some(subcommand) = env::args_os().nth(1)
+        && (subcommand == "inspect" || subcommand == "recovery")
+    {
+        let result = if subcommand == "inspect" {
+            inspect::command(env::args_os().skip(2))
+        } else {
+            recovery::command(env::args_os().skip(2))
+        };
+        match result {
             Ok(code) => std::process::exit(code),
             Err(error) => {
                 eprintln!("[inhibitor-lab] {error}");
