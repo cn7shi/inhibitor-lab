@@ -1,0 +1,10 @@
+{
+  "rules": [
+    {
+      "id": "repeated-error-text",
+      "source": "stderr",
+      "contains": "ERROR",
+      "threshold": 2
+    }
+  ]
+}
