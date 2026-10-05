@@ -16,7 +16,7 @@
 
 规则完全由配置决定；`stderr` 本身不代表错误。当前不判断错误语义，也不执行自动熔断、重试、恢复或修改模型上下文。
 
-开发过程见 [阶段记录](docs/development-log.md)、[决策记录](docs/decisions.md)，本轮证据摘要见 [Pi 本地验证](docs/verification/pi-local.md)。
+开发过程见 [阶段记录](docs/development-log.md)、[决策记录](docs/decisions.md)，证据摘要见 [Pi 本地验证](docs/verification/pi-local.md) 和 [可靠性自查](docs/verification/self-review.md)。
 
 ## Pi 本地验证（不需要模型账号）
 
@@ -109,9 +109,9 @@ Pi 适配器仅解析 stdout 中的 `tool_execution_end`，严格要求非空 `t
 
 `rule_triggered.data.matched_event_sequence` 指向本次触发对应的输出或统一事件；统一事件的 `data.raw_event_sequence` 再指向原始输出。文本规则记录 `matched_lines`，事件规则记录 `matched_events`。两个流各自保序，跨流序号表示采集顺序；时间戳表示采集时间，不承诺是子进程内的实际发生时间。
 
-每行最多保留 64 KiB，超长部分会被读完并丢弃，事件标记 `truncated: true`，该行不参与规则判断。文本按 UTF-8 解码，无效字节替换为替代字符。终端转发会规范化换行，因此本版本面向文本输出程序。事件队列最多缓存 256 行，写入缓慢时会对采集施加背压。
+每行最多保留 64 KiB，超长部分会被读完并丢弃，事件标记 `truncated: true`，该行不参与规则判断。文本按 UTF-8 解码，无效字节替换为替代字符，同时标记 `invalid_utf8: true`。普通文本模式维持替换解码后的匹配；Pi stdout 中的无效编码行不参与任何规则匹配。终端转发会规范化换行，因此本版本面向文本输出程序。事件队列最多缓存 256 行，写入缓慢时会对采集施加背压。
 
-Pi stdout 的无效 JSON、缺失必填字段、冲突结果或截断记录会生成 `adapter_error`；后续记录继续采集，但结束时 `adapter_complete: false`，启动器返回 2。`run_finished.exit_code` / `success` 仍描述子进程本身，需同时检查 `capture_complete` 和 `adapter_complete`。大体积工具结果或汇总事件可能超过当前 64 KiB 上限，此时不会宣称采集适配完整。
+Pi stdout 的无效 UTF-8、无效 JSON、缺失必填字段、冲突结果或截断记录会生成 `adapter_error`；后续记录继续采集，但结束时 `adapter_complete: false`，启动器返回 2。`run_finished.exit_code` / `success` 仍描述子进程本身，需同时检查 `capture_complete` 和 `adapter_complete`。大体积工具结果或汇总事件可能超过当前 64 KiB 上限，此时不会宣称采集适配完整。
 
 当前尚未接入本地日志文件跟随、MCP 代理、交互式终端、进程树熔断和人工恢复。若子进程将输出管道交给后台后代进程，采集可能需要等待这些后代关闭管道。
 
@@ -121,9 +121,11 @@ Pi stdout 的无效 JSON、缺失必填字段、冲突结果或截断记录会�
 cargo fmt --check
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
+npm --prefix integrations/pi test
+npm --prefix integrations/pi run check:local
 ```
 
-13 项 Rust 测试覆盖文本采集、规则、Pi 结果去重、假阳性排除、损坏输入、证据关联、退出码和已有日志保护。另有 `check:local` 启动真实 Pi 验证完整链路，Windows CI 执行两组验证。
+15 项 Rust 测试覆盖文本采集、规则、Pi 结果去重、假阳性排除、损坏输入、证据关联、退出码和已有日志保护；3 项 Node 测试检查半条日志下的进程清理。另有 `check:local` 启动真实 Pi 验证完整链路，Windows CI 执行全部验证。
 
 ## 后续实验
 

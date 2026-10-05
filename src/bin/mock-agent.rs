@@ -23,6 +23,11 @@ fn main() {
             print!("final line without newline");
             io::stdout().flush().unwrap();
         }
+        "pi-invalid-utf8" => {
+            let mut stdout = io::stdout().lock();
+            stdout.write_all(b"{\"type\":\"tool_execution_end\",\"toolCallId\":\"bad-\xff\",\"toolName\":\"read\",\"isError\":true}\n").unwrap();
+            stdout.write_all(b"{\"type\":\"tool_execution_end\",\"toolCallId\":\"valid\",\"toolName\":\"read\",\"isError\":true}\n").unwrap();
+        }
         scenario @ ("pi" | "pi-malformed") => {
             println!(r#"{{"type":"session","id":"test"}}"#);
             if scenario == "pi-malformed" {

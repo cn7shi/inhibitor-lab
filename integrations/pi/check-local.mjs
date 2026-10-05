@@ -8,6 +8,7 @@ import { createServer } from "node:http";
 import { dirname, join, resolve } from "node:path";
 import { finished } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
+import { stopRun } from "./process-cleanup.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, "../..");
@@ -101,14 +102,13 @@ try {
   child.stdout.pipe(stdout);
   child.stderr.pipe(stderr);
   let timedOut = false;
-  const timeout = setTimeout(async () => {
+  let cleanup = Promise.resolve();
+  const timeout = setTimeout(() => {
     timedOut = true;
-    // Kill only the Pi process whose PID this fresh journal recorded, then the launcher.
-    try {
-      const started = (await readEvents()).find((event) => event.kind === "run_started");
-      if (started) process.kill(started.data.pid);
-    } catch { /* The child may already have exited. */ }
-    child.kill();
+    cleanup = stopRun(child, journal).catch((error) => {
+      serverErrors.push(`Timeout cleanup failed: ${error}`);
+      console.error(`Timeout cleanup failed: ${error}`);
+    });
   }, 30000);
   let exitCode;
   try {
@@ -119,6 +119,7 @@ try {
     await Promise.all([finished(stdout), finished(stderr)]);
   } finally {
     clearTimeout(timeout);
+    await cleanup;
   }
   assert.equal(timedOut, false, `Pi timed out; see ${run}`);
   assert.deepEqual(serverErrors, [], `Fixture failed; see ${run}`);

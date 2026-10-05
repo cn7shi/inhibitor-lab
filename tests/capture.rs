@@ -54,6 +54,33 @@ fn execute_format(scenario: &str, rules: &str, format: &str) -> (std::process::O
 const PI_RULES: &str = include_str!("../examples/pi-rules.json");
 
 #[test]
+fn invalid_utf8_cannot_become_pi_evidence_or_trigger_a_rule() {
+    let (output, events) = execute_format("pi-invalid-utf8", PI_RULES, "pi-json");
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["kind"] == "agent_event")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["kind"] == "adapter_error")
+            .count(),
+        1
+    );
+    assert_eq!(events.last().unwrap()["data"]["adapter_complete"], false);
+    assert_eq!(events.last().unwrap()["data"]["trigger_count"], 0);
+    assert!(
+        events
+            .iter()
+            .any(|event| event["data"]["invalid_utf8"] == true)
+    );
+}
+
+#[test]
 fn pi_results_are_deduplicated_and_trigger_links_back_to_the_second_failure() {
     let (output, events) = execute_format("pi", PI_RULES, "pi-json");
     assert!(output.status.success());

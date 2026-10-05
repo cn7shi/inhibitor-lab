@@ -207,12 +207,19 @@ impl RuleEngine {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct CapturedLine {
+    pub text: String,
+    pub truncated: bool,
+    pub invalid_utf8: bool,
+}
+
 /// Retain at most `limit` bytes per line, draining the rest without unbounded allocation.
 /// Truncated lines are reported to the caller, which must not match them as complete evidence.
 pub fn read_line_bounded(
     reader: &mut impl BufRead,
     limit: usize,
-) -> io::Result<Option<(String, bool)>> {
+) -> io::Result<Option<CapturedLine>> {
     let mut retained = Vec::new();
     let mut truncated = false;
     let mut seen = false;
@@ -239,10 +246,13 @@ pub fn read_line_bounded(
     if retained.last() == Some(&b'\r') {
         retained.pop();
     }
-    Ok(Some((
-        String::from_utf8_lossy(&retained).into_owned(),
+    let text = String::from_utf8_lossy(&retained);
+    let invalid_utf8 = matches!(&text, std::borrow::Cow::Owned(_));
+    Ok(Some(CapturedLine {
+        text: text.into_owned(),
         truncated,
-    )))
+        invalid_utf8,
+    }))
 }
 
 #[cfg(test)]
@@ -322,16 +332,50 @@ mod tests {
         let mut reader = Cursor::new(b"123456789\nnext\r\nlast");
         assert_eq!(
             read_line_bounded(&mut reader, 5).unwrap(),
-            Some(("12345".into(), true))
+            Some(CapturedLine {
+                text: "12345".into(),
+                truncated: true,
+                invalid_utf8: false
+            })
         );
         assert_eq!(
             read_line_bounded(&mut reader, 5).unwrap(),
-            Some(("next".into(), false))
+            Some(CapturedLine {
+                text: "next".into(),
+                truncated: false,
+                invalid_utf8: false
+            })
         );
         assert_eq!(
             read_line_bounded(&mut reader, 5).unwrap(),
-            Some(("last".into(), false))
+            Some(CapturedLine {
+                text: "last".into(),
+                truncated: false,
+                invalid_utf8: false
+            })
         );
         assert_eq!(read_line_bounded(&mut reader, 5).unwrap(), None);
+    }
+
+    #[test]
+    fn valid_unicode_is_distinguished_from_replaced_invalid_bytes() {
+        let mut valid = Cursor::new("\u{fffd}\u{2028}text\n".as_bytes());
+        let line = read_line_bounded(&mut valid, 100).unwrap().unwrap();
+        assert_eq!(line.text, "\u{fffd}\u{2028}text");
+        assert!(!line.invalid_utf8);
+        assert!(read_line_bounded(&mut valid, 100).unwrap().is_none());
+        let mut invalid = Cursor::new(b"\xff\nnext\n");
+        assert!(
+            read_line_bounded(&mut invalid, 100)
+                .unwrap()
+                .unwrap()
+                .invalid_utf8
+        );
+        assert!(
+            !read_line_bounded(&mut invalid, 100)
+                .unwrap()
+                .unwrap()
+                .invalid_utf8
+        );
     }
 }

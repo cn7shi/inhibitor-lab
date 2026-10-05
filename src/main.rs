@@ -1,4 +1,4 @@
-use inhibitor_lab::{RuleEngine, Source, Trigger, pi::PiAdapter, read_line_bounded};
+use inhibitor_lab::{CapturedLine, RuleEngine, Source, Trigger, pi::PiAdapter, read_line_bounded};
 use serde_json::{Value, json};
 use std::env;
 use std::ffi::OsString;
@@ -124,7 +124,7 @@ fn record_triggers(
 }
 
 enum Capture {
-    Line(Source, String, bool),
+    Line(Source, CapturedLine),
     Error(Source, String),
 }
 
@@ -132,8 +132,8 @@ fn capture(reader: impl Read, source: Source, sender: SyncSender<Capture>) {
     let mut reader = BufReader::new(reader);
     loop {
         match read_line_bounded(&mut reader, 64 * 1024) {
-            Ok(Some((text, truncated))) => {
-                if sender.send(Capture::Line(source, text, truncated)).is_err() {
+            Ok(Some(line)) => {
+                if sender.send(Capture::Line(source, line)).is_err() {
                     return;
                 }
             }
@@ -212,10 +212,17 @@ fn run(options: Options) -> Result<i32, Box<dyn std::error::Error>> {
     let mut trigger_count = 0;
     for captured in receiver {
         match captured {
-            Capture::Line(source, text, truncated) => {
+            Capture::Line(
+                source,
+                CapturedLine {
+                    text,
+                    truncated,
+                    invalid_utf8,
+                },
+            ) => {
                 let sequence = journal.emit(
                     "output",
-                    json!({"source": source, "text": text, "truncated": truncated}),
+                    json!({"source": source, "text": text, "truncated": truncated, "invalid_utf8": invalid_utf8}),
                 )?;
                 let display_text = if truncated {
                     format!("{text} [truncated]")
@@ -231,6 +238,11 @@ fn run(options: Options) -> Result<i32, Box<dyn std::error::Error>> {
                         adapter_complete = false;
                         journal.emit("adapter_error", json!({"adapter": "pi", "raw_event_sequence": sequence, "error": "truncated Pi record; skipped"}))?;
                     }
+                    continue;
+                }
+                if options.pi_json && source == Source::Stdout && invalid_utf8 {
+                    adapter_complete = false;
+                    journal.emit("adapter_error", json!({"adapter": "pi", "raw_event_sequence": sequence, "error": "invalid UTF-8 Pi record; skipped"}))?;
                     continue;
                 }
                 trigger_count +=
