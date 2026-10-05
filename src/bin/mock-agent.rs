@@ -54,12 +54,16 @@ fn gate_mock(scenario: &str) {
             }
             _ => panic!("unexpected gate test command"),
         }
-        let id = if scenario == "gate-repeat" && step == 1 {
+        let id = if (scenario == "gate-repeat" && step == 1)
+            || (scenario == "gate-repeat-after-close" && step == 2)
+        {
             "gate-tool-0".to_owned()
         } else {
             format!("gate-tool-{step}")
         };
-        let request_id = if scenario == "gate-repeat-request" {
+        let request_id = if scenario == "gate-repeat-request"
+            || (scenario == "gate-repeat-request-after-close" && (step == 0 || step == 2))
+        {
             "fixed".to_owned()
         } else {
             format!("request-{step}")

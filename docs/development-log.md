@@ -2,6 +2,25 @@
 
 记录目的：保留“为什么做、改了什么、如何验证、还缺什么”。Git 保存代码快照，本文件保存阶段过程，`decisions.md` 保存决策，`runs/` 保存本机运行证据。
 
+## 阶段 4：并发与嵌套准入边界（2026-10-05，实现与本地验收完成）
+
+- 用户授权按既定计划继续；基线 `ef64b8f`，开始时工作区干净。
+- 目标：用真实 Pi 和隔离文件效果验证同批工具、关闭后新请求、工具内部再调用工具的准入行为。
+- 验收：明确关联每次批准 / 拒绝与实际效果；既有批准不能被误称为撤销，关闭后的新请求不得重新放行；重复请求不能绕过；确认嵌套调用是否有钩子和结果证据。
+- 方法：沿用固定 Pi 1.0.3 与本机确定性模型服务，必要时加入仅供测试的工具扩展；先记录实际现象，再修复影响本契约的问题。不得用固定睡眠掩盖竞态。
+- 范围：补齐可重复测试、记录、OCR 委托复核和 CI。暂不添加人工恢复、真实模型凭据、串行执行策略或 MCP。
+
+### 编码与首次实测
+
+1. 核对已安装 Pi 1.0.3 的批次调度、`ctx.executeTool()` 与嵌套事件实现，并查阅上游扩展文档。批次默认先准备全部调用再执行；标准嵌套接口保留父调用 ID 并触发同一套钩子。
+2. 新增独立 `check-boundaries.mjs`：真实内置 read / write 同批三个调用，后续同批再请求两次写入；新增仅测试加载的 `boundary-tools.js`：父工具调用子工具，子工具依次发起两次失败读取与两次写入。每类比较 record / block，均无额外延迟。
+3. 首次四组实测全部通过。批次 record：`runs/pi-boundary-batch-record-FCi8fz/`，三个效果文件存在；批次 block：`runs/pi-boundary-batch-block-QPSJTl/`，已提前批准的文件存在，后续两个文件不存在，确认拒绝 2 次。
+4. 嵌套 record：`runs/pi-boundary-nested-record-MZLn20/`，两个文件均存在；嵌套 block：`runs/pi-boundary-nested-block-q5Y2LK/`，两个文件均不存在，确认拒绝 2 次。5 个子调用结果均可回指父调用和准入决定，两组 Pi 正常退出。
+5. 加入关闭后重放旧工具 / 请求 ID 的 Rust 回归，以及并发等待中迟到的肯定回复不能解除拒绝锁定的 Node 回归。实际结果证明此前声明的边界，不需要修改生产准入逻辑。
+6. `cargo fmt`、`cargo test --locked`、`cargo clippy --locked --all-targets -- -D warnings` 全部通过，Rust 共 31 项；`npm --prefix integrations/pi test` 14 项通过。真实四组对照通过 `npm --prefix integrations/pi run check:boundaries`，已加入 Windows CI。
+7. OCR `delegate preview` / `delegate rule` 识别 7 个代码 / 配置文件、4 组规则；当前助手复核文件效果断言、父子与准入关联、超时清理、重放失败、依赖及 CI，没有新增阻断发现。不是独立模型复核。规则、测试输出和首次四组结果在 `runs/pi-boundary-review-2026-10-05/`。
+8. 同步 README、D011 与 [边界实验报告](verification/pi-boundaries.md)。没有安装新工具或增加依赖；人工恢复、严格调度、真实模型、嵌套内部并行仍未实施 / 验证。远端 CI 随本阶段提交执行并关联提交。
+
 ## 阶段 3：Pi 工具执行前准入拦截（2026-10-05，实现与本地验收完成）
 
 - 用户授权继续下一步；基线 `c8decbc`，开始时工作区干净。

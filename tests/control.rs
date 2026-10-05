@@ -379,6 +379,31 @@ fn unrelated_extension_dialog_is_never_automatically_approved() {
 }
 
 #[test]
+fn replaying_an_old_tool_or_request_after_closure_cannot_reuse_approval() {
+    for scenario in ["gate-repeat-after-close", "gate-repeat-request-after-close"] {
+        let (output, events) = execute(scenario, "block", RULES, "test");
+        assert_eq!(output.status.code(), Some(2), "{scenario}");
+        let closed = events.iter().find(|e| e["kind"] == "gate_closed").unwrap()["sequence"]
+            .as_u64()
+            .unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| e["kind"] == "gate_decision" && e["sequence"].as_u64().unwrap() > closed)
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e["kind"] == "gate_decision")
+                .count(),
+            2
+        );
+        assert_eq!(events.last().unwrap()["data"]["control_outcome"], "failed");
+        assert_eq!(events.last().unwrap()["data"]["blocked_tool_count"], 0);
+    }
+}
+
+#[test]
 fn block_requires_gate_and_gate_cannot_be_combined_with_abort() {
     for (action, gate, message) in [
         ("block", false, "requires --tool-gate"),

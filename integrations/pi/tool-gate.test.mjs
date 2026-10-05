@@ -11,7 +11,7 @@ function harness(confirm) {
   const ctx = { mode: "rpc", hasUI: true, ui: {
     confirm, notify(message) { notices.push(JSON.parse(message)); },
   } };
-  return { call: (ctxOverride = {}) => handler({ toolCallId: "call-1", toolName: "write" }, { ...ctx, ...ctxOverride }), notices, marker };
+  return { call: (ctxOverride = {}, toolCallId = "call-1") => handler({ toolCallId, toolName: "write" }, { ...ctx, ...ctxOverride }), notices, marker };
 }
 
 test("execution stays pending until an explicit matching boolean approval", async () => {
@@ -55,4 +55,18 @@ test("non-RPC mode, cancellation and transport errors fail closed", async () => 
   assert.equal((await cancelled.call({ signal: AbortSignal.abort() })).block, true);
   const broken = harness(async () => { throw new Error("transport unavailable"); });
   assert.equal((await broken.call()).block, true);
+});
+
+test("a late approval cannot reopen the gate after another concurrent call was denied", async () => {
+  const replies = new Map();
+  const h = harness((_title, message) => new Promise((resolve) => {
+    replies.set(JSON.parse(message).tool_call_id, resolve);
+  }));
+  const earlier = h.call({}, "earlier");
+  const later = h.call({}, "later");
+  replies.get("later")(false);
+  assert.equal((await later).block, true);
+  replies.get("earlier")(true);
+  assert.equal((await earlier).block, true);
+  assert.deepEqual(h.notices.map((notice) => [notice.tool_call_id, notice.allowed]), [["later", false], ["earlier", false]]);
 });

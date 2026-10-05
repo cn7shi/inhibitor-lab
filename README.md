@@ -17,7 +17,7 @@
 
 规则完全由配置决定；`stderr` 本身不代表错误。当前不判断错误语义。Pi RPC 可请求中止，配合自有扩展可关闭新工具准入；已经放行的并发工具不能撤销。尚不提供重试、人工恢复或上下文修复。
 
-开发过程见 [阶段记录](docs/development-log.md)、[决策记录](docs/decisions.md)，证据摘要见 [Pi 本地验证](docs/verification/pi-local.md)、[可靠性自查](docs/verification/self-review.md)、[OCR 委托审查](docs/verification/ocr-delegate.md)、[RPC 中止实验](docs/verification/pi-rpc.md) 和 [工具准入实验](docs/verification/pi-gate.md)。
+开发过程见 [阶段记录](docs/development-log.md)、[决策记录](docs/decisions.md)，证据摘要见 [Pi 本地验证](docs/verification/pi-local.md)、[可靠性自查](docs/verification/self-review.md)、[OCR 委托审查](docs/verification/ocr-delegate.md)、[RPC 中止实验](docs/verification/pi-rpc.md)、[工具准入实验](docs/verification/pi-gate.md) 和 [并发与嵌套边界](docs/verification/pi-boundaries.md)。
 
 ## Pi 本地验证（不需要模型账号）
 
@@ -85,10 +85,23 @@ npm --prefix integrations/pi run check:gate
 - 扩展在执行前等待 Rust 的明确布尔放行，等待期限为 5 秒；超时、异常、取消或非 RPC 环境默认拒绝。Rust 只回答本项目的准入协议，不自动批准其它扩展的交互请求。
 - 首次触发后，本次运行不再批准新的工具请求；只能开始新运行重置。Pi 收到拒绝会生成一个合成错误结果，该结果单独记录，不计入工具失败规则。
 - `control_outcome: blocked` 表示已有扩展应用拒绝的证据；`gate_closed` 表示准入已关闭，但没有确认拒绝过后续调用。两者在 Pi 正常退出且采集完整时，启动器返回 3；协议或退出异常返回 2。
-- 同批并发工具可能在规则触发前已全部获得放行，即使尚未实际执行也不能撤回。当前是合作式扩展协议，信任本地 Pi 与扩展，不是操作系统沙箱；嵌套与并发专项试验尚未完成。
+- 同批并发工具可能在规则触发前已全部获得放行，即使尚未实际执行也不能撤回。已通过真实同批工具和两层嵌套试验；嵌套内部并行、任意深度和插件直接文件操作尚未覆盖。当前是合作式扩展协议，信任本地 Pi 与扩展，不是操作系统沙箱。
 - 无效工具名或参数可能在 Pi 准入钩子之前返回错误；当前会因缺少准入证据而结束运行，报告协议失败，不继续按普通工具失败计数。
 
 Pi 的 `tool_execution_start` 出现在准入钩子之前。因此 `tool_started_after_trigger` 只能表示收到了开始事件，不能证明工具已经执行；本实验同时核对准入决定、扩展应用确认和实际文件效果。
+
+## 并发与嵌套边界验证
+
+```powershell
+npm --prefix integrations/pi run check:boundaries
+```
+
+该脚本运行四组真实 Pi 对照，均不加入额外等待，不调用外部模型：
+
+- 同批两次失败读取和一次写入：三个调用在任何结果返回前已经获准，所以拦截模式下这个写入仍产生文件。下一批的两次新写入均被拒绝；仅记录组则全部写入成功。
+- 两层嵌套：测试父工具调用子工具，子工具通过 `ctx.executeTool()` 发起两次失败读取和两次写入。拦截组的两次写入都被拒绝，包括首次拒绝后的重试；仅记录组写入成功。日志核对五条父子关系及对应准入决定。
+
+本轮验证了关闭新准入的边界，没有新增串行调度或取消已获准父工具。只供测试使用的 `boundary-tools.js` 由脚本显式加载，实际文件操作仍走 Pi 内置工具。按调用计数的规则不做根因去重：子工具失败后父工具若也报告失败，会作为另一个工具结果参与计数。
 
 ## 运行实验
 
@@ -179,12 +192,13 @@ npm --prefix integrations/pi test
 npm --prefix integrations/pi run check:local
 npm --prefix integrations/pi run check:rpc
 npm --prefix integrations/pi run check:gate
+npm --prefix integrations/pi run check:boundaries
 ```
 
-30 项 Rust 测试覆盖文本采集、规则、Pi 结果去重、损坏输入、证据关联，以及 RPC 控制、准入确认、异常响应、超时、退出和竞态记录；13 项 Node 测试检查进程清理、输出写入失败、超时、错误保留及扩展拒绝行为。`check:local`、`check:rpc` 和 `check:gate` 启动真实 Pi 验证观察、中止及准入链路，Windows CI 执行全部验证。
+31 项 Rust 测试覆盖文本采集、规则、Pi 结果去重、损坏输入、证据关联，以及 RPC 控制、准入确认、关闭后请求重放、异常响应、超时、退出和竞态记录；14 项 Node 测试检查进程清理、输出写入失败、超时、错误保留及扩展拒绝行为（含并发迟到批准）。`check:local`、`check:rpc`、`check:gate` 和 `check:boundaries` 启动真实 Pi 验证观察、中止及准入边界，Windows CI 执行全部验证。
 
 ## 后续实验
 
 1. 配置用户选择的模型服务，验证真实模型运行时的事件。
-2. 验证并发和嵌套调用的准入边界，再设计带明确证据的人工恢复。
+2. 基于已验证的新准入契约设计人工恢复，单独评估限制提前放行的调度策略。
 3. 增加本地日志来源与 MCP 观测，处理不同来源之间的重复事件。
