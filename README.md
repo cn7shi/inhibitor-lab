@@ -2,7 +2,7 @@
 
 本地 Agent 错误治理的独立实验工程，使用 Rust 从头搭建。
 
-首次阅读或交接给其他 Agent，请先看 [项目导读与源码教程](tutorial.md)：项目意图、演进理由、八课阅读路线、证据解释与人工恢复设计都从这一个文件进入。
+首次阅读或交接给其他 Agent，请先看 [项目导读与源码教程](tutorial.md)：项目意图、演进理由、九课阅读路线、证据解释与人工恢复流程都从这一个文件进入。
 
 当前阶段验证：**启动进程 → 获取输出 → 转换工具结果 → 匹配显式规则 → 记录触发 → 可选 Pi RPC 中止或工具准入拦截**。
 
@@ -17,9 +17,9 @@
 - 写入逐行 JSON 事件，保留运行 ID、事件序号、采集时间和触发依据。
 - 观察模式让子进程继续运行并保留其退出码；RPC 模式额外记录控制结果。
 - 只读诊断已有日志，关联触发、准入决定、应用确认与收尾，说明是否满足后续人工继续的日志条件。
-- 为合格父运行准备新任务配置，经明确确认保存唯一的待启动关联；新进程启动尚未接入。
+- 为合格父运行准备新任务配置，经明确确认单次启动关联的新运行，重新建立计数与门禁，保存启动和终态证据。
 
-规则完全由配置决定；`stderr` 本身不代表错误。当前不判断错误语义。Pi RPC 可请求中止，配合自有扩展可关闭新工具准入；已经放行的并发工具不能撤销。尚不提供重试、人工恢复或上下文修复。
+规则完全由配置决定；`stderr` 本身不代表错误。当前不判断错误语义。Pi RPC 可请求中止，配合自有扩展可关闭新工具准入；已经放行的并发工具不能撤销。人工继续创建新运行，尚不提供自动重试、原会话恢复或上下文修复。
 
 开发过程见 [阶段记录](docs/development-log.md)、[决策记录](docs/decisions.md)，证据摘要见 [Pi 本地验证](docs/verification/pi-local.md)、[可靠性自查](docs/verification/self-review.md)、[OCR 委托审查](docs/verification/ocr-delegate.md)、[RPC 中止实验](docs/verification/pi-rpc.md)、[工具准入实验](docs/verification/pi-gate.md) 和 [并发与嵌套边界](docs/verification/pi-boundaries.md)。
 
@@ -32,11 +32,11 @@
 .\target\debug\inhibitor-lab.exe inspect --log runs/<某次实验>/events.jsonl --format json
 ```
 
-默认中文摘要，显示规则、阈值、证据序号、门是否关闭、确认拒绝数和退出完整性。JSON 字段 `eligible_for_manual_restart` 仅表示日志满足首版继续条件，后续需单独准备和确认；`resume` 启动尚未实现。本命令不修改日志、不启动 Agent、不执行日志里的程序名。
+默认中文摘要，显示规则、阈值、证据序号、门是否关闭、确认拒绝数和退出完整性。JSON 字段 `eligible_for_manual_restart` 仅表示日志满足首版继续条件，后续需单独准备、确认和启动。本命令不修改日志、不启动 Agent、不执行日志里的程序名。新子运行额外显示 `linkage`，仅核对本日志中的关联字段。
 
 `inspect` 返回 0 表示诊断有效，即使 record / abort 等不满足继续条件；损坏、未知版本、未结束、超限或读取失败返回 2。不能用退出 0 代替人工许可。限额为 32 MiB 文件、1 MiB 单行、100,000 条记录；较早日志缺少关键字段也会明确拒绝。详见 [诊断验证与限制](docs/verification/inspect.md)。
 
-## 准备下一次运行并确认
+## 准备、确认并开启下一次运行
 
 先按需要调整 [新任务配置示例](examples/recovery-config.example.json) 的原因、任务和路径。示例使用本机 Scoop Node 路径；相对 `rules` / `cwd` / `program` 以配置文件所在目录解析。若把配置另存到 `runs/`，应相应调整这些路径或使用绝对路径；个人配置、计划和确认记录建议放在忽略目录 `runs/`。
 
@@ -47,7 +47,25 @@
 
 确认界面展示父运行原因、新任务、规则、目录、程序参数和预留运行 ID。输入显示的 `CONFIRM recovery-...` 并换行后，保存 `recovery-plan.json.confirmed.json`，状态为 **已确认、尚未启动**。取消 / EOF 返回 3；文件或内容无效、变化、重复确认返回 2；准备 / 确认保存成功返回 0。
 
-父日志不改，计划和确认文件不覆盖。父日志、配置、规则、计划均绑定摘要；在查看期间变化会使确认失效。计划复制 / 改名不可直接复用，同一计划并发确认仅一份成功。下一阶段启动前仍须复核并单独占用启动记录；本阶段没有实际创建新 Agent。详见 [R2 验证及限制](docs/verification/recovery-prepare.md)。
+父日志不改，计划和确认文件不覆盖。父日志、配置、规则、计划均绑定摘要；在查看期间变化会使确认失效。计划复制 / 改名不可直接复用，同一计划并发确认仅一份成功。准备 / 确认阶段见 [R2 验证及限制](docs/verification/recovery-prepare.md)。确认后可显式启动：
+
+```powershell
+.\target\debug\inhibitor-lab.exe recovery start --plan runs/recovery-plan.json
+.\target\debug\inhibitor-lab.exe inspect --log runs/recovery-plan.json.run.jsonl
+```
+
+启动重新核对全部来源与确认，使用已审阅配置和规则快照创建新进程。规则计数、适配器和门禁重新建立；原问题仍存在时可再次触发关闭。现有命令不能修改计划中的提示、程序或规则；需要变化时重新准备、确认。模型凭据仍需外部配置，示例不能直接证明真实模型可用。
+
+| 原计划追加的文件名 | 含义 |
+| --- | --- |
+| `.confirmed.json` | 确认时的不可变记录，`confirmed_not_started` 不是实时状态 |
+| `.start.json` | 启动前原子占位；存在后同一计划不再执行，包含不完整占位 |
+| `.run.jsonl` | 子运行日志；首条启动与 PID，第二条父运行关联，最终收尾 |
+| `.result.json` | 独立启动结果，关联占位摘要、进程 ID、返回码及收尾 |
+
+`start` 返回 0 表示正常完成，3 表示正常受控结束（含再次关闭），2 表示拒绝启动或失败。结果 `run_finished` 仅表示有完整收尾记录，需同时查看 `launcher_exit_code` 与 `finish.control_outcome`；另外区分 `not_spawned`、`spawn_failed`、`runner_failed`。已有文件不覆盖，启动失败也不能重用确认。
+
+有启动占位但缺少完整结果时，可能仍在运行或结果未知，先人工核对进程和影响，不自动重试。文件与进程创建没有事务原子性；摘要不认证人，也不绑定程序二进制、脚本、环境或整个目录内容。R3 已用真实模拟 Agent 进程验证，真实 Pi 两轮恢复对照留待 R4；详见 [启动验证](docs/verification/recovery-start.md)。
 
 ## Pi 本地验证（不需要模型账号）
 
@@ -210,7 +228,7 @@ RPC 增加 `rpc_command_requested`、`rpc_command_written`、`rpc_response`、`r
 
 Pi stdout 的无效 UTF-8、无效 JSON、缺失必填字段、冲突结果或截断记录会生成 `adapter_error`；Pi JSON 观察模式继续采集，结束时 `adapter_complete: false`，启动器返回 2。RPC 模式在协议损坏后进入失败清理，不再据此确认控制成功；准入模式可能先通过 `gate_error` / `control_failed` 报告无效输入或关联失败。`run_finished.exit_code` / `success` 仍描述子进程本身，需同时检查 `control_outcome`、`capture_complete` 和 `adapter_complete`。大体积工具结果或汇总事件可能超过当前 64 KiB 上限，此时不会宣称采集适配完整。
 
-当前尚未接入本地日志文件跟随、MCP 代理、交互式终端、进程树熔断和人工恢复。观察模式可能等待后台后代关闭继承的输出管道；RPC 异常期限到达后不再无限等待这些读取线程，但不承诺已经停止后代。终端转发和日志仍为同步 I/O，期限不是系统级硬实时保证。
+当前尚未接入本地日志文件跟随、MCP 代理、交互式终端、进程树熔断和原会话恢复。观察模式可能等待后台后代关闭继承的输出管道；RPC 异常期限到达后不再无限等待这些读取线程，但不承诺已经停止后代。终端转发和日志仍为同步 I/O，期限不是系统级硬实时保证。
 
 ## 验证
 
@@ -230,5 +248,5 @@ npm --prefix integrations/pi run check:boundaries
 ## 后续实验
 
 1. 配置用户选择的模型服务，验证真实模型运行时的事件。
-2. 按 [导读中的人工恢复方案](tutorial.md) 接入 R3 启动消费、新进程及关联日志，再做 R4 两轮验证；R1 诊断和 R2 准备 / 确认已完成。限制提前放行的调度策略另行评估。
+2. 按 [导读中的人工恢复方案](tutorial.md) 做 R4 真实 Pi 两轮验证：修正条件后 B 完成，未修正则 B 再次关闭；R1–R3 已完成并有进程回归。限制提前放行的调度策略另行评估。
 3. 增加本地日志来源与 MCP 观测，处理不同来源之间的重复事件。

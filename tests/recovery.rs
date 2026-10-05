@@ -162,6 +162,346 @@ fn confirmation(path: &Path) -> Command {
     command
 }
 
+fn start_command(path: &Path) -> Command {
+    let mut command = Command::new(BIN);
+    command
+        .args(["recovery", "start", "--plan"])
+        .arg(path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+impl Fixture {
+    fn start_setup(&self, scenario: &str) -> Value {
+        update_json(&self.config, |value| {
+            value["program"] = json!(MOCK);
+            value["args"] = json!([scenario, "mark-start"]);
+            value["timeout_ms"] = json!(3000);
+            value["control_timeout_ms"] = json!(500);
+        });
+        let plan = self.prepared();
+        expect_code(&self.confirm(self.token().as_bytes()), 0);
+        plan
+    }
+
+    fn start(&self) -> Output {
+        start_command(&self.plan).output().unwrap()
+    }
+
+    fn sidecar(&self, suffix: &str) -> PathBuf {
+        self.root.join(format!("plan.json{suffix}"))
+    }
+
+    fn child_events(&self) -> Vec<Value> {
+        fs::read_to_string(self.sidecar(".run.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn inspect_child(&self) -> Output {
+        Command::new(BIN)
+            .args(["inspect", "--log"])
+            .arg(self.sidecar(".run.jsonl"))
+            .args(["--format", "json"])
+            .output()
+            .unwrap()
+    }
+
+    fn no_start(&self) {
+        assert!(!self.sidecar(".start.json").exists());
+        assert!(!self.sidecar(".run.jsonl").exists());
+        assert!(!self.sidecar(".result.json").exists());
+        assert!(!self.root.join("work/start-markers.jsonl").exists());
+    }
+}
+
+#[test]
+fn confirmed_start_links_real_child_resets_counts_and_can_block_again() {
+    let fixture = Fixture::new();
+    let plan = fixture.start_setup("gate-block");
+    let receipt = fs::read(&fixture.receipt).unwrap();
+    let plan_bytes = fs::read(&fixture.plan).unwrap();
+    expect_code(&fixture.start(), 3);
+    let events = fixture.child_events();
+    assert_eq!(events[0]["kind"], "run_started");
+    assert!(events[0]["data"]["pid"].as_u64().unwrap() > 0);
+    assert_eq!(events[1]["kind"], "run_linked");
+    assert_eq!(
+        events[1]["data"]["parent_run_id"],
+        plan["inputs"]["parent"]["run_id"]
+    );
+    assert!(events.iter().all(|e| e["run_id"] == plan["planned_run_id"]));
+    let results: Vec<_> = events
+        .iter()
+        .filter(|e| e["kind"] == "agent_event")
+        .collect();
+    assert_eq!(results.len(), 2);
+    let trigger = events
+        .iter()
+        .find(|e| e["kind"] == "rule_triggered")
+        .unwrap();
+    assert_eq!(
+        trigger["data"]["matched_event_sequence"],
+        results[1]["sequence"]
+    );
+    let decisions: Vec<_> = events
+        .iter()
+        .filter(|e| e["kind"] == "gate_decision")
+        .collect();
+    assert_eq!(decisions.len(), 3);
+    assert_eq!(decisions[0]["data"]["allowed"], true);
+    assert_eq!(decisions[1]["data"]["allowed"], true);
+    assert_eq!(decisions[2]["data"]["allowed"], false);
+    let summary = read_json(&fixture.sidecar(".result.json"));
+    assert_eq!(summary["status"], "run_finished");
+    assert_eq!(summary["launcher_exit_code"], 3);
+    assert_eq!(summary["finish"]["control_outcome"], "blocked");
+    assert_eq!(summary["finish"]["trigger_count"], 1);
+    assert_eq!(fs::read(&fixture.parent).unwrap(), fixture.original_parent);
+    assert_eq!(fs::read(&fixture.plan).unwrap(), plan_bytes);
+    assert_eq!(fs::read(&fixture.receipt).unwrap(), receipt);
+    let inspected = fixture.inspect_child();
+    expect_code(&inspected, 0);
+    let report: Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    assert_eq!(report["linkage"], events[1]["data"]);
+    assert_eq!(report["eligible_for_manual_restart"], true);
+    // A new explicit plan can use this child as its parent; this is not an automatic retry.
+    let next = Command::new(BIN)
+        .args(["recovery", "prepare", "--parent"])
+        .arg(fixture.sidecar(".run.jsonl"))
+        .arg("--config")
+        .arg(&fixture.config)
+        .arg("--out")
+        .arg(fixture.root.join("next.json"))
+        .output()
+        .unwrap();
+    expect_code(&next, 0);
+    assert_eq!(
+        read_json(&fixture.root.join("next.json"))["inputs"]["parent"]["run_id"],
+        plan["planned_run_id"]
+    );
+}
+
+#[test]
+fn successful_start_uses_selected_cwd_and_preserves_all_records_on_replay() {
+    let fixture = Fixture::new();
+    fixture.start_setup("gate-success");
+    expect_code(&fixture.start(), 0);
+    let result = read_json(&fixture.sidecar(".result.json"));
+    assert_eq!(result["finish"]["control_outcome"], "completed");
+    assert_eq!(result["finish"]["trigger_count"], 0);
+    let marker = fixture.root.join("work/start-markers.jsonl");
+    assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 1);
+    let paths = [
+        fixture.plan.clone(),
+        fixture.receipt.clone(),
+        fixture.parent.clone(),
+        fixture.sidecar(".start.json"),
+        fixture.sidecar(".run.jsonl"),
+        fixture.sidecar(".result.json"),
+        marker,
+    ];
+    let before: Vec<_> = paths.iter().map(|p| fs::read(p).unwrap()).collect();
+    expect_code(&fixture.start(), 2);
+    assert_eq!(
+        paths
+            .iter()
+            .map(|p| fs::read(p).unwrap())
+            .collect::<Vec<_>>(),
+        before
+    );
+    expect_code(&fixture.inspect_child(), 0);
+}
+
+#[test]
+fn two_start_processes_consume_confirmation_only_once() {
+    let fixture = Fixture::new();
+    fixture.start_setup("gate-success");
+    let first = start_command(&fixture.plan).spawn().unwrap();
+    let second = start_command(&fixture.plan).spawn().unwrap();
+    let mut codes = [
+        first.wait_with_output().unwrap().status.code().unwrap(),
+        second.wait_with_output().unwrap().status.code().unwrap(),
+    ];
+    codes.sort();
+    assert_eq!(codes, [0, 2]);
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("work/start-markers.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert_eq!(
+        read_json(&fixture.sidecar(".result.json"))["status"],
+        "run_finished"
+    );
+}
+
+#[test]
+fn unconfirmed_cancelled_or_changed_inputs_never_start() {
+    for changed in [
+        "missing",
+        "cancelled",
+        "parent",
+        "config",
+        "rules",
+        "plan",
+        "confirmation",
+        "extra-field",
+        "partial",
+    ] {
+        let fixture = Fixture::new();
+        fixture.start_setup("gate-success");
+        match changed {
+            "missing" | "cancelled" => {
+                fs::remove_file(&fixture.receipt).unwrap();
+                if changed == "cancelled" {
+                    expect_code(&fixture.confirm(b"no\n"), 3);
+                }
+            }
+            "parent" => {
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(&fixture.parent)
+                    .unwrap()
+                    .write_all(b"\n")
+                    .unwrap();
+            }
+            "config" => update_json(&fixture.config, |v| v["prompt"] = json!("unreviewed")),
+            "rules" => {
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(&fixture.rules)
+                    .unwrap()
+                    .write_all(b" ")
+                    .unwrap();
+            }
+            "plan" => {
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(&fixture.plan)
+                    .unwrap()
+                    .write_all(b" ")
+                    .unwrap();
+            }
+            "confirmation" => update_json(&fixture.receipt, |v| {
+                v["rules_sha256"] = json!("f".repeat(64))
+            }),
+            "extra-field" => update_json(&fixture.receipt, |v| v["extra"] = json!(true)),
+            "partial" => fs::write(&fixture.receipt, b"{").unwrap(),
+            _ => unreachable!(),
+        }
+        expect_code(&fixture.start(), 2);
+        fixture.no_start();
+    }
+}
+
+#[test]
+fn existing_start_output_or_result_including_partial_records_prevent_execution() {
+    for suffix in [".start.json", ".run.jsonl", ".result.json"] {
+        let fixture = Fixture::new();
+        fixture.start_setup("gate-success");
+        let path = fixture.sidecar(suffix);
+        fs::write(&path, b"{").unwrap();
+        let output = fixture.start();
+        expect_code(&output, 2);
+        if suffix == ".start.json" {
+            assert!(String::from_utf8_lossy(&output.stderr).contains("结果未知"));
+        }
+        assert_eq!(fs::read(path).unwrap(), b"{");
+        assert!(!fixture.root.join("work/start-markers.jsonl").exists());
+    }
+}
+
+#[test]
+fn spawn_failure_is_consumed_and_control_failure_is_not_success() {
+    for failure in ["spawn", "control"] {
+        let fixture = Fixture::new();
+        if failure == "spawn" {
+            let program = fixture.root.join("not-executable.txt");
+            fs::write(&program, b"not a program").unwrap();
+            update_json(&fixture.config, |v| v["program"] = json!(program));
+            fixture.prepared();
+            expect_code(&fixture.confirm(fixture.token().as_bytes()), 0);
+        } else {
+            fixture.start_setup("gate-missing");
+        }
+        expect_code(&fixture.start(), 2);
+        let result = read_json(&fixture.sidecar(".result.json"));
+        assert_eq!(result["launcher_exit_code"], 2);
+        if failure == "spawn" {
+            assert_eq!(result["status"], "spawn_failed");
+            assert_eq!(fixture.child_events()[0]["kind"], "spawn_failed");
+            assert!(result["pid"].is_null());
+        } else {
+            assert_eq!(result["status"], "run_finished");
+            assert_eq!(result["finish"]["control_outcome"], "failed");
+        }
+        let before = fs::read(fixture.sidecar(".result.json")).unwrap();
+        expect_code(&fixture.start(), 2);
+        assert_eq!(fs::read(fixture.sidecar(".result.json")).unwrap(), before);
+    }
+}
+
+#[test]
+fn invalid_or_misplaced_lineage_is_rejected() {
+    let fixture = Fixture::new();
+    fixture.start_setup("gate-block");
+    expect_code(&fixture.start(), 3);
+    let original = fixture.child_events();
+    for defect in ["id", "hash", "self-parent", "extra", "missing", "late"] {
+        let mut events = original.clone();
+        match defect {
+            "id" => events[1]["data"]["recovery_id"] = json!("wrong"),
+            "hash" => events[1]["data"]["plan_sha256"] = json!("bad"),
+            "self-parent" => events[1]["data"]["parent_run_id"] = events[1]["run_id"].clone(),
+            "extra" => events[1]["data"]["unknown"] = json!(true),
+            "missing" => {
+                events.remove(1);
+            }
+            "late" => events.swap(1, 2),
+            _ => unreachable!(),
+        }
+        for (index, event) in events.iter_mut().enumerate() {
+            event["sequence"] = json!(index + 1);
+        }
+        let text = events.iter().map(|e| format!("{e}\n")).collect::<String>();
+        fs::write(fixture.sidecar(".run.jsonl"), text).unwrap();
+        expect_code(&fixture.inspect_child(), 2);
+    }
+}
+
+#[test]
+fn broken_output_after_spawn_records_runner_failure_without_retry() {
+    let fixture = Fixture::new();
+    fixture.start_setup("gate-success");
+    let mut process = start_command(&fixture.plan).spawn().unwrap();
+    // Closing the actual reader makes the launcher's first forwarded RPC output fail.
+    drop(process.stdout.take());
+    expect_code(&process.wait_with_output().unwrap(), 2);
+    let result = read_json(&fixture.sidecar(".result.json"));
+    assert_eq!(result["status"], "runner_failed");
+    assert!(result["pid"].as_u64().unwrap() > 0);
+    assert!(result["finish"].is_null());
+    assert!(result["error"].is_string());
+    assert_ne!(
+        fixture.child_events().last().unwrap()["kind"],
+        "run_finished"
+    );
+    expect_code(&fixture.start(), 2);
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("work/start-markers.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+}
+
 // Wait for the actual confirmation prompt, without sleeps or production test hooks.
 struct Waiting {
     child: Option<Child>,

@@ -25,11 +25,15 @@ Usage:
   inhibitor-lab inspect --log <events.jsonl> [--format text|json]
   inhibitor-lab recovery prepare --parent <events.jsonl> --config <new-run.json> --out <plan.json>
   inhibitor-lab recovery confirm --plan <plan.json>
+  inhibitor-lab recovery start --plan <plan.json>
 
 Inspect is read-only. Exit 0 means a valid diagnostic, not permission to restart.
-Invalid/incomplete/unsupported logs return 2. No resume command is implemented yet.
+Invalid/incomplete/unsupported logs return 2.
 Recovery prepare/confirm save a plan and one confirmed-not-started receipt; neither starts a child.
 Recovery exit 0 means saved, 3 means cancelled, 2 means invalid, changed, or already confirmed.
+Recovery start consumes a confirmed plan once; exit 0 means completed, 3 means controlled stop,
+2 means failure or rejected start. It writes .start.json, .run.jsonl and .result.json beside the plan.
+An existing start record prevents retry even when the outcome is unknown.
 
 RPC options (pi-rpc only):
   --prompt <text>                 Required single prompt sent over stdin
@@ -292,15 +296,40 @@ impl Drop for ManagedChild {
 }
 
 fn run(options: Options) -> Result<i32, Box<dyn std::error::Error>> {
+    let rules = RuleEngine::from_json(&fs::read_to_string(&options.rules)?)?;
+    execute(options, rules, None, &mut RunProgress::default())
+}
+
+struct RunContext {
+    run_id: String,
+    cwd: PathBuf,
+    link: recovery::RunLink,
+}
+
+#[derive(Default)]
+struct RunProgress {
+    spawn_attempted: bool,
+    pid: Option<u32>,
+    finish: Option<Value>,
+}
+
+fn execute(
+    options: Options,
+    mut rules: RuleEngine,
+    context: Option<RunContext>,
+    progress: &mut RunProgress,
+) -> Result<i32, Box<dyn std::error::Error>> {
     let pi_json = options.format != "text";
     let pi_rpc = options.format == "pi-rpc";
-    let mut rules = RuleEngine::from_json(&fs::read_to_string(&options.rules)?)?;
     if rules.requires_agent_events() && !pi_json {
         return Err("event rules require --format pi-json or pi-rpc".into());
     }
     let mut adapter = pi_json.then(PiAdapter::default);
     let mut adapter_complete = true;
-    let run_id = format!("{}-{}", now_ms(), std::process::id());
+    let run_id = context.as_ref().map_or_else(
+        || format!("{}-{}", now_ms(), std::process::id()),
+        |context| context.run_id.clone(),
+    );
     let output = options
         .output
         .unwrap_or_else(|| PathBuf::from(format!("runs/{run_id}.jsonl")));
@@ -317,7 +346,12 @@ fn run(options: Options) -> Result<i32, Box<dyn std::error::Error>> {
     };
     eprintln!("[inhibitor-lab] event log: {}", output.display());
     let program = &options.command[0];
-    let spawn_result = Command::new(program)
+    let mut command = Command::new(program);
+    if let Some(context) = &context {
+        command.current_dir(&context.cwd);
+    }
+    progress.spawn_attempted = true;
+    let spawn_result = command
         .args(&options.command[1..])
         .stdin(if pi_rpc {
             Stdio::piped()
@@ -337,10 +371,15 @@ fn run(options: Options) -> Result<i32, Box<dyn std::error::Error>> {
             return Err(error.into());
         }
     };
+    progress.pid = Some(child.0.id());
     journal.emit(
         "run_started",
         json!({"program": program.to_string_lossy(), "pid": child.0.id(), "format": options.format}),
     )?;
+    if let Some(context) = &context {
+        journal.emit("run_linked", serde_json::to_value(&context.link)?)?;
+        journal.file.sync_all()?;
+    }
     let stdout = child.0.stdout.take().ok_or("missing stdout pipe")?;
     let stderr = child.0.stderr.take().ok_or("missing stderr pipe")?;
     let (sender, receiver) = sync_channel(256);
@@ -566,7 +605,12 @@ fn run(options: Options) -> Result<i32, Box<dyn std::error::Error>> {
     } else {
         "completed"
     };
-    journal.emit("run_finished", json!({"exit_code": status.code(), "success": status.success(), "trigger_count": trigger_count, "capture_complete": !capture_failed, "adapter_complete": adapter_complete, "control_outcome": control_outcome, "forced_cleanup": forced_cleanup, "blocked_tool_count": blocked_count}))?;
+    let finish = json!({"exit_code": status.code(), "success": status.success(), "trigger_count": trigger_count, "capture_complete": !capture_failed, "adapter_complete": adapter_complete, "control_outcome": control_outcome, "forced_cleanup": forced_cleanup, "blocked_tool_count": blocked_count});
+    journal.emit("run_finished", finish.clone())?;
+    if context.is_some() {
+        journal.file.sync_all()?;
+    }
+    progress.finish = Some(finish);
     if !adapter_complete {
         eprintln!("[inhibitor-lab] Pi input was incomplete or invalid; see adapter_error events");
     }

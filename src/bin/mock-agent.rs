@@ -7,6 +7,14 @@ fn emit(value: Value) {
 }
 
 fn gate_mock(scenario: &str) {
+    if std::env::args().nth(2).as_deref() == Some("mark-start") {
+        let mut marker = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("start-markers.jsonl")
+            .unwrap();
+        writeln!(marker, "{}", std::process::id()).unwrap();
+    }
     let mut step = 0;
     for line in io::stdin().lock().lines() {
         let command: Value = serde_json::from_str(&line.unwrap()).unwrap();
@@ -44,7 +52,7 @@ fn gate_mock(scenario: &str) {
                     );
                 }
                 emit(
-                    json!({"type":"tool_execution_end","toolCallId":id,"toolName":name,"isError":if scenario == "gate-deny-success" && !allowed { false } else { !allowed || step < 2 }}),
+                    json!({"type":"tool_execution_end","toolCallId":id,"toolName":name,"isError":if scenario == "gate-deny-success" && !allowed { false } else { !allowed || (step < 2 && scenario != "gate-success") }}),
                 );
                 step += 1;
                 if step == 3 || (step == 2 && scenario == "gate-no-next") {

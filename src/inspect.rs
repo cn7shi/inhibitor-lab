@@ -28,6 +28,7 @@ struct Report {
     status: &'static str,
     run_id: Option<String>,
     format: Option<String>,
+    linkage: Option<Value>,
     event_count: usize,
     triggers: Vec<Value>,
     gate_closed_sequence: Option<u64>,
@@ -45,6 +46,7 @@ impl Default for Report {
             status: "invalid",
             run_id: None,
             format: None,
+            linkage: None,
             event_count: 0,
             triggers: Vec::new(),
             gate_closed_sequence: None,
@@ -55,7 +57,7 @@ impl Default for Report {
             limitations: [
                 "这里只核对日志内部证据，不认证作者；缺少旧规则快照，不能重算完整规则条件。",
                 "已经批准的工具可能产生效果，需要另行核对；工具开始事件不能证明文件变化。",
-                "满足条件不等于已获人工许可；尚未实现 resume，本命令不会启动程序。",
+                "满足条件不等于已获人工许可；关联只核对本日志字段，不认证外部记录；本命令不会启动程序。",
             ],
         }
     }
@@ -196,6 +198,11 @@ fn validate(events: &[Event], report: &mut Report) -> Check<()> {
             .push("进程启动失败，没有可继续的已结束门禁运行".into());
         return Ok(());
     }
+    require(
+        !first.run_id.starts_with("recovery-")
+            || events.get(1).is_some_and(|e| e.kind == "run_linked"),
+        "恢复子运行缺少紧接启动的关联记录",
+    )?;
     let format = string(&first.data, "format")?;
     require(
         ["text", "pi-json", "pi-rpc"].contains(&format),
@@ -238,6 +245,14 @@ fn validate(events: &[Event], report: &mut Report) -> Check<()> {
                 }
             }
             match event.kind.as_str() {
+                "run_linked" => {
+                    require(
+                        at == 1 && format == "pi-rpc",
+                        "关联必须是 RPC 启动后的第二条记录",
+                    )?;
+                    crate::recovery::validate_link(d, &event.run_id)?;
+                    report.linkage = Some(d.clone());
+                }
                 "output" => {
                     require(
                         ["stdout", "stderr"].contains(&string(d, "source")?),
@@ -720,6 +735,9 @@ pub fn command(mut args: impl Iterator<Item = OsString>) -> Check<i32> {
                 t["evidence_kind"],
                 t["raw_event_sequence"]
             );
+        }
+        if let Some(linkage) = &report.linkage {
+            println!("父运行关联：{linkage}");
         }
         println!(
             "准入关闭序号：{:?}\n已确认拒绝：{} 次",

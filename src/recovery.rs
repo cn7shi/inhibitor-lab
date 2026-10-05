@@ -1,4 +1,4 @@
-//! Preparation and explicit confirmation only. No process creation or start consumption in R2.
+//! Explicit preparation, confirmation and single-consumption start of a new linked run.
 use crate::evidence_file::{create, digest, read};
 use crate::inspect::{ParentEvidence, recovery_snapshot};
 use inhibitor_lab::RuleEngine;
@@ -9,6 +9,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CONFIG_LIMIT: u64 = 1024 * 1024;
@@ -52,6 +53,55 @@ struct Plan {
     plan_path: PathBuf,
     policy: Value,
     inputs: Inputs,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Confirmation {
+    schema_version: u8,
+    kind: String,
+    status: String,
+    recovery_id: String,
+    planned_run_id: String,
+    parent_run_id: String,
+    parent_sha256: String,
+    config_sha256: String,
+    rules_sha256: String,
+    plan_path: PathBuf,
+    plan_sha256: String,
+    confirmed_at_unix_ms: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RunLink {
+    recovery_id: String,
+    parent_run_id: String,
+    parent_sha256: String,
+    plan_sha256: String,
+    confirmation_sha256: String,
+    counter_reset: String,
+}
+
+pub(super) fn validate_link(data: &Value, child_id: &str) -> Check<()> {
+    let link: RunLink = serde_json::from_value(data.clone()).map_err(|_| "关联字段无效")?;
+    require(
+        link.recovery_id
+            .strip_prefix("recovery-")
+            .is_some_and(|s| s.len() == 24 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            && child_id == format!("{}-child", link.recovery_id)
+            && !link.parent_run_id.trim().is_empty()
+            && link.parent_run_id != child_id
+            && link.counter_reset == "new_run"
+            && [
+                &link.parent_sha256,
+                &link.plan_sha256,
+                &link.confirmation_sha256,
+            ]
+            .iter()
+            .all(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())),
+        "关联身份、摘要或计数策略无效",
+    )
 }
 
 fn policy() -> Value {
@@ -159,9 +209,20 @@ fn encode(value: &impl Serialize) -> Check<Vec<u8>> {
 }
 
 fn receipt_path(plan: &Path) -> PathBuf {
+    sidecar(plan, ".confirmed.json")
+}
+
+fn sidecar(plan: &Path, suffix: &str) -> PathBuf {
     let mut name = plan.as_os_str().to_os_string();
-    name.push(".confirmed.json");
+    name.push(suffix);
     name.into()
+}
+
+fn vacant(path: &Path) -> Check<()> {
+    require(
+        !path.try_exists().map_err(|_| "无法检查输出路径")?,
+        "该位置已有记录，不会覆盖或重试；请核对记录后重新准备计划",
+    )
 }
 
 fn identity(path: &Path, prepared_at_unix_ms: u64, inputs: &Inputs) -> Check<String> {
@@ -189,6 +250,9 @@ fn prepare(parent: &Path, config: &Path, output: &Path) -> Check<i32> {
             .map_err(|_| "无法检查确认路径")?,
         "该位置已存在确认记录，请核对后选择新计划位置",
     )?;
+    for suffix in [".start.json", ".run.jsonl", ".result.json"] {
+        vacant(&sidecar(&plan_path, suffix))?;
+    }
     let prepared_at_unix_ms = now_ms()?;
     let inputs = inputs(parent, config)?;
     let recovery_id = identity(&plan_path, prepared_at_unix_ms, &inputs)?;
@@ -253,7 +317,7 @@ fn confirm(path: &Path, input: &mut impl BufRead, output: &mut impl Write) -> Ch
         "该计划已有确认或占位记录，不能重复确认",
     )?;
     // JSON presentation preserves exact arguments while escaping terminal control characters.
-    writeln!(output, "请核对父运行原因和新任务配置：\n{}\n新运行将重置规则计数和准入状态。当前阶段仅保存确认，不启动程序。\n输入 CONFIRM {} 并换行以确认；其它输入或 EOF 取消。",
+    writeln!(output, "请核对父运行原因和新任务配置：\n{}\n新运行将重置规则计数和准入状态。此命令仅保存确认，不启动程序。\n输入 CONFIRM {} 并换行以确认；其它输入或 EOF 取消。",
         serde_json::to_string_pretty(&plan).map_err(|e| e.to_string())?, plan.recovery_id).map_err(|e| e.to_string())?;
     output.flush().map_err(|e| e.to_string())?;
     let mut answer = Vec::new();
@@ -295,14 +359,137 @@ fn confirm(path: &Path, input: &mut impl BufRead, output: &mut impl Write) -> Ch
     Ok(0)
 }
 
+fn start(path: &Path) -> Check<i32> {
+    let path = canonical(path)?;
+    let claim_path = sidecar(&path, ".start.json");
+    let output_path = sidecar(&path, ".run.jsonl");
+    let result_path = sidecar(&path, ".result.json");
+    // Even a partial claim is consumed. Absence of a result never authorizes retry.
+    require(
+        !claim_path.try_exists().map_err(|_| "无法检查启动占位")?,
+        "该计划已有启动占位，不能重试；请核对 .result.json 与 .run.jsonl，缺少完整结果意味着可能仍在运行或结果未知",
+    )?;
+    for reserved in [&output_path, &result_path] {
+        vacant(reserved)?;
+    }
+    let bytes = read(&path, PLAN_LIMIT)?;
+    let plan: Plan = serde_json::from_slice(&bytes).map_err(|_| "计划 JSON 无效或不完整")?;
+    verify(&plan, &path)?;
+    let plan_sha256 = digest(&bytes);
+    let receipt_bytes = read(&receipt_path(&path), 64 * 1024)?;
+    let receipt: Confirmation =
+        serde_json::from_slice(&receipt_bytes).map_err(|_| "缺少有效的明确确认记录")?;
+    require(
+        receipt.schema_version == 1
+            && receipt.kind == "recovery_confirmation"
+            && receipt.status == "confirmed_not_started"
+            && receipt.recovery_id == plan.recovery_id
+            && receipt.planned_run_id == plan.planned_run_id
+            && receipt.parent_run_id == plan.inputs.parent.run_id
+            && receipt.parent_sha256 == plan.inputs.parent.sha256
+            && receipt.config_sha256 == plan.inputs.config_sha256
+            && receipt.rules_sha256 == plan.inputs.rules_sha256
+            && receipt.plan_path == path
+            && receipt.plan_sha256 == plan_sha256,
+        "确认记录与已审阅计划不一致，请重新准备并确认",
+    )?;
+    let confirmation_sha256 = digest(&receipt_bytes);
+    // Build the engine from the verified snapshot, never reopen a mutable rule path in execute.
+    let rules = RuleEngine::from_json(&plan.inputs.rules_snapshot.to_string())
+        .map_err(|e| e.to_string())?;
+    let link = RunLink {
+        recovery_id: plan.recovery_id.clone(),
+        parent_run_id: plan.inputs.parent.run_id.clone(),
+        parent_sha256: plan.inputs.parent.sha256.clone(),
+        plan_sha256: plan_sha256.clone(),
+        confirmation_sha256: confirmation_sha256.clone(),
+        counter_reset: "new_run".into(),
+    };
+    let claim = json!({
+        "schema_version":1,"kind":"recovery_start","status":"start_reserved",
+        "recovery_id":plan.recovery_id,"planned_run_id":plan.planned_run_id,
+        "plan_path":path,"plan_sha256":plan_sha256,"confirmation_sha256":confirmation_sha256,
+        "parent_run_id":plan.inputs.parent.run_id,"parent_sha256":plan.inputs.parent.sha256,
+        "confirmed_at_unix_ms":receipt.confirmed_at_unix_ms,"reserved_at_unix_ms":now_ms()?,
+        "output_path":output_path,"result_path":result_path,
+    });
+    let claim_bytes = encode(&claim)?;
+    create(&claim_path, &claim_bytes)?;
+    let mut progress = crate::RunProgress::default();
+    let outcome = (|| -> Check<i32> {
+        require(
+            canonical(&path)? == path
+                && digest(&read(&path, PLAN_LIMIT)?) == plan_sha256
+                && digest(&read(&receipt_path(&path), 64 * 1024)?) == confirmation_sha256,
+            "占位后计划或确认发生变化，已停止；该计划不再重试",
+        )?;
+        verify(&plan, &path)?;
+        vacant(&result_path)?;
+        let config = &plan.inputs.new_run;
+        let command = std::iter::once(config.program.as_os_str().to_owned())
+            .chain(config.args.iter().map(OsString::from))
+            .collect();
+        let options = crate::Options {
+            rules: config.rules.clone(),
+            output: Some(output_path.clone()),
+            command,
+            format: "pi-rpc",
+            prompt: Some(config.prompt.clone()),
+            action: crate::Action::Block,
+            tool_gate: true,
+            timeout: Duration::from_millis(config.timeout_ms),
+            control_timeout: Duration::from_millis(config.control_timeout_ms),
+        };
+        crate::execute(
+            options,
+            rules,
+            Some(crate::RunContext {
+                run_id: plan.planned_run_id.clone(),
+                cwd: config.cwd.clone(),
+                link,
+            }),
+            &mut progress,
+        )
+        .map_err(|e| e.to_string())
+    })();
+    let status = if outcome.is_ok() {
+        "run_finished"
+    } else if progress.pid.is_some() {
+        "runner_failed"
+    } else if progress.spawn_attempted {
+        "spawn_failed"
+    } else {
+        "not_spawned"
+    };
+    let result = json!({
+        "schema_version":1,"kind":"recovery_result","status":status,
+        "recovery_id":plan.recovery_id,"run_id":plan.planned_run_id,
+        "start_sha256":digest(&claim_bytes),"output_path":output_path,
+        "recorded_at_unix_ms":now_ms().ok(),"pid":progress.pid,
+        "launcher_exit_code":outcome.as_ref().copied().unwrap_or(2),
+        "finish":progress.finish,"error":outcome.as_ref().err(),
+    });
+    create(&result_path, &encode(&result)?).map_err(|error| {
+        format!("启动已消费，但结果保存失败，结果可能未知；不要重试同一计划：{error}")
+    })?;
+    eprintln!(
+        "[inhibitor-lab] 启动结果：{}，记录：{}",
+        status,
+        json!(result_path)
+    );
+    outcome
+}
+
 pub fn command(mut args: impl Iterator<Item = OsString>) -> Check<i32> {
-    let mode = args.next().ok_or("recovery 需要 prepare 或 confirm")?;
+    let mode = args
+        .next()
+        .ok_or("recovery 需要 prepare、confirm 或 start")?;
     let allowed: &[&str] = if mode == "prepare" {
         &["--parent", "--config", "--out"]
-    } else if mode == "confirm" {
+    } else if mode == "confirm" || mode == "start" {
         &["--plan"]
     } else {
-        return Err("recovery 只支持 prepare 或 confirm".into());
+        return Err("recovery 只支持 prepare、confirm 或 start".into());
     };
     let mut options = HashMap::new();
     while let Some(arg) = args.next() {
@@ -326,6 +513,8 @@ pub fn command(mut args: impl Iterator<Item = OsString>) -> Check<i32> {
             &options["--config"],
             &options["--out"],
         )
+    } else if mode == "start" {
+        start(&options["--plan"])
     } else {
         confirm(
             &options["--plan"],
