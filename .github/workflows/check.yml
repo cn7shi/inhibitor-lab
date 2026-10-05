@@ -27,3 +27,4 @@ jobs:
       - run: npm --prefix integrations/pi run check:rpc
       - run: npm --prefix integrations/pi run check:gate
       - run: npm --prefix integrations/pi run check:boundaries
+      - run: npm --prefix integrations/pi run check:recovery

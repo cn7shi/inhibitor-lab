@@ -7,7 +7,8 @@
     "check:local": "node check-local.mjs",
     "check:rpc": "node check-local.mjs rpc-record && node check-local.mjs rpc-abort",
     "check:gate": "node check-local.mjs gate-record && node check-local.mjs gate-block",
-    "check:boundaries": "node check-boundaries.mjs"
+    "check:boundaries": "node check-boundaries.mjs",
+    "check:recovery": "node check-recovery-runs.mjs"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "1.0.3"

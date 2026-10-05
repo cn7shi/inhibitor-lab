@@ -2,7 +2,7 @@
 
 本地 Agent 错误治理的独立实验工程，使用 Rust 从头搭建。
 
-首次阅读或交接给其他 Agent，请先看 [项目导读与源码教程](tutorial.md)：项目意图、演进理由、九课阅读路线、证据解释与人工恢复流程都从这一个文件进入。
+首次阅读或交接给其他 Agent，请先看 [项目导读与源码教程](tutorial.md)：项目意图、演进理由、十课阅读路线、证据解释与人工恢复流程都从这一个文件进入。
 
 当前阶段验证：**启动进程 → 获取输出 → 转换工具结果 → 匹配显式规则 → 记录触发 → 可选 Pi RPC 中止或工具准入拦截**。
 
@@ -65,7 +65,22 @@
 
 `start` 返回 0 表示正常完成，3 表示正常受控结束（含再次关闭），2 表示拒绝启动或失败。结果 `run_finished` 仅表示有完整收尾记录，需同时查看 `launcher_exit_code` 与 `finish.control_outcome`；另外区分 `not_spawned`、`spawn_failed`、`runner_failed`。已有文件不覆盖，启动失败也不能重用确认。
 
-有启动占位但缺少完整结果时，可能仍在运行或结果未知，先人工核对进程和影响，不自动重试。文件与进程创建没有事务原子性；摘要不认证人，也不绑定程序二进制、脚本、环境或整个目录内容。R3 已用真实模拟 Agent 进程验证，真实 Pi 两轮恢复对照留待 R4；详见 [启动验证](docs/verification/recovery-start.md)。
+有启动占位但缺少完整结果时，可能仍在运行或结果未知，先人工核对进程和影响，不自动重试。文件与进程创建没有事务原子性；摘要不认证人，也不绑定程序二进制、脚本、环境或整个目录内容。R3 的并发及故障进程回归见 [启动验证](docs/verification/recovery-start.md)，R4 的真实 Pi 两轮恢复已验证如下。
+
+构建并安装项目内 Pi 依赖后，可在不配置真实模型的情况下复现：
+
+```powershell
+npm --prefix integrations/pi run check:recovery
+```
+
+两组都先让真实 Pi A 读取两个缺失文件，累计两次失败后拦截写入。随后走准备、确认和实际 `recovery start`，新 Pi B 使用同一规则、提示和工具步骤。
+
+| B 启动前的条件 | B 实际结果 | 文件效果 |
+| --- | --- | --- |
+| 实验操作者补齐两个输入文件 | 两次读取和一次写入成功，0 触发，退出 0 | `effect.txt` 内容为 `recovery-proof` 加换行 |
+| 输入仍缺失 | 第二次失败后再次触发，拒绝一次写入，退出 3 | `effect.txt` 不存在 |
+
+脚本还核对新会话、重复工具 ID 可重新计数、父日志不变、父子摘要关联、重复启动拒绝，以及确认后配置变化必须重新准备 / 确认。模型回复来自本机固定服务，确认由测试输入模拟，文件修正由实验明确执行；不是自动修复或真实模型能力测试。原始证据在脚本显示的 `runs/pi-recovery-*`，摘要和限制见 [R4 报告](docs/verification/pi-recovery.md)。
 
 ## Pi 本地验证（不需要模型账号）
 
@@ -241,12 +256,13 @@ npm --prefix integrations/pi run check:local
 npm --prefix integrations/pi run check:rpc
 npm --prefix integrations/pi run check:gate
 npm --prefix integrations/pi run check:boundaries
+npm --prefix integrations/pi run check:recovery
 ```
 
-54 项 Rust 测试覆盖文本采集、规则、Pi 适配、RPC / 准入、诊断，以及人工准备 / 确认中的取消、变化、身份关联、并发唯一性与无执行副作用；14 项 Node 测试检查进程清理、输出写入失败、超时、错误保留及扩展拒绝行为（含并发迟到批准）。`check:local`、`check:rpc`、`check:gate` 和 `check:boundaries` 启动真实 Pi 验证观察、中止及准入边界；最后一个脚本还验证只读诊断和两份父运行的 R2 确认链，独立重算摘要并检查原文不变。Windows CI 执行全部验证。
+62 项 Rust 测试覆盖采集、规则、Pi 适配、RPC / 准入、诊断，以及人工准备 / 确认 / 启动中的变化、身份关联、并发唯一性、新计数、失败和重复消费；14 项 Node 测试检查进程清理、输出写入失败、超时、错误保留及扩展拒绝行为（含并发迟到批准）。`check:local`、`check:rpc`、`check:gate` 和 `check:boundaries` 验证真实 Pi 观察、中止及准入边界；`check:boundaries` 也覆盖 R1 / R2；新增 `check:recovery` 验证实际 A → 确认 → B 两轮和文件效果。Windows CI 执行全部验证。
 
 ## 后续实验
 
 1. 配置用户选择的模型服务，验证真实模型运行时的事件。
-2. 按 [导读中的人工恢复方案](tutorial.md) 做 R4 真实 Pi 两轮验证：修正条件后 B 完成，未修正则 B 再次关闭；R1–R3 已完成并有进程回归。限制提前放行的调度策略另行评估。
+2. R1–R4 已完成。下一步建议增加只读的恢复状态汇总，统一解释计划、确认、启动占位、子日志及结果，尤其是“结果未知”；该命令尚未实现。限制提前放行的调度策略另行评估。
 3. 增加本地日志来源与 MCP 观测，处理不同来源之间的重复事件。
