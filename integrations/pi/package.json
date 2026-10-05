@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test process-cleanup.test.mjs",
+    "test": "node --test process-cleanup.test.mjs capture-output.test.mjs",
     "check:local": "node check-local.mjs"
   },
   "devDependencies": {

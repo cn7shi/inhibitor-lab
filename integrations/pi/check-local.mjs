@@ -6,8 +6,8 @@ import { createWriteStream } from "node:fs";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { dirname, join, resolve } from "node:path";
-import { finished } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
+import { captureOutput } from "./capture-output.mjs";
 import { stopRun } from "./process-cleanup.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -99,29 +99,9 @@ try {
   });
   const stdout = createWriteStream(join(run, "stdout.jsonl"));
   const stderr = createWriteStream(join(run, "stderr.log"));
-  child.stdout.pipe(stdout);
-  child.stderr.pipe(stderr);
-  let timedOut = false;
-  let cleanup = Promise.resolve();
-  const timeout = setTimeout(() => {
-    timedOut = true;
-    cleanup = stopRun(child, journal).catch((error) => {
-      serverErrors.push(`Timeout cleanup failed: ${error}`);
-      console.error(`Timeout cleanup failed: ${error}`);
-    });
-  }, 30000);
-  let exitCode;
-  try {
-    exitCode = await new Promise((resolve, reject) => {
-      child.once("error", reject);
-      child.once("close", resolve);
-    });
-    await Promise.all([finished(stdout), finished(stderr)]);
-  } finally {
-    clearTimeout(timeout);
-    await cleanup;
-  }
-  assert.equal(timedOut, false, `Pi timed out; see ${run}`);
+  const exitCode = await captureOutput(child, stdout, stderr, {
+    stop: () => stopRun(child, journal),
+  });
   assert.deepEqual(serverErrors, [], `Fixture failed; see ${run}`);
   assert.equal(exitCode, 0, `Launcher/Pi failed; see ${join(run, "stderr.log")}`);
   assert.deepEqual(requests.map((request) => request.step), [0, 1, 2, 3]);

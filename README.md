@@ -16,7 +16,7 @@
 
 规则完全由配置决定；`stderr` 本身不代表错误。当前不判断错误语义，也不执行自动熔断、重试、恢复或修改模型上下文。
 
-开发过程见 [阶段记录](docs/development-log.md)、[决策记录](docs/decisions.md)，证据摘要见 [Pi 本地验证](docs/verification/pi-local.md) 和 [可靠性自查](docs/verification/self-review.md)。
+开发过程见 [阶段记录](docs/development-log.md)、[决策记录](docs/decisions.md)，证据摘要见 [Pi 本地验证](docs/verification/pi-local.md)、[可靠性自查](docs/verification/self-review.md) 和 [OCR 委托审查](docs/verification/ocr-delegate.md)。
 
 ## Pi 本地验证（不需要模型账号）
 
@@ -125,7 +125,7 @@ npm --prefix integrations/pi test
 npm --prefix integrations/pi run check:local
 ```
 
-15 项 Rust 测试覆盖文本采集、规则、Pi 结果去重、假阳性排除、损坏输入、证据关联、退出码和已有日志保护；3 项 Node 测试检查半条日志下的进程清理。另有 `check:local` 启动真实 Pi 验证完整链路，Windows CI 执行全部验证。
+15 项 Rust 测试覆盖文本采集、规则、Pi 结果去重、假阳性排除、损坏输入、证据关联、退出码和已有日志保护；9 项 Node 测试检查半条日志下的进程清理、输出写入失败、超时及错误保留。另有 `check:local` 启动真实 Pi 验证完整链路，Windows CI 执行全部验证。
 
 ## 后续实验
 

@@ -2,6 +2,8 @@
 
 审查基线：Pi 接入提交 `daa41fc`。执行方式：源码自查、先失败后通过的回归测试、真实 Pi 本地复验。本报告不是 OCR 生成的审查结果。
 
+后续更正：本报告记录当时 `ocr review` 因无模型端点失败的事实；之后已使用无需单独模型 API 的 `ocr delegate` 完成规则委托审查，详见 [阶段 1.2 报告](ocr-delegate.md)。下文保留当时的自查与工具状态，不能据此认为 OCR 所有模式都需要配置模型。
+
 ## OpenCodeReview 状态
 
 - 已安装阿里 `@alibaba-group/open-code-review` 1.12.12，二进制版本 `182898c`。
