@@ -1,22 +1,30 @@
 use inhibitor_lab::{CapturedLine, RuleEngine, Source, Trigger, pi::PiAdapter, read_line_bounded};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{SyncSender, sync_channel};
+use std::sync::mpsc::{RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const HELP: &str = "inhibitor-lab: capture process output and emit explicit rule triggers\n\nUsage:\n  inhibitor-lab run --rules <rules.json> [--format text|pi-json] [--out <events.jsonl>] -- <program> [args...]\n\nText rules match case-sensitive substrings. Pi JSON mode also normalizes tool results.\nTriggers are recorded only; the child keeps running. Malformed Pi stdout records cause exit 2 after capture.\nLogs default to runs/<run-id>.jsonl. Existing output files are never overwritten.";
+mod control;
+use control::RpcControl;
+
+const HELP: &str = "inhibitor-lab: capture process output and emit explicit rule triggers\n\nUsage:\n  inhibitor-lab run --rules <rules.json> [--format text|pi-json|pi-rpc] [--out <events.jsonl>] -- <program> [args...]\n\nRPC options (pi-rpc only):\n  --prompt <text>                 Required single prompt sent over stdin\n  --on-trigger record|abort       Default: record\n  --timeout-ms <1..86400000>       Total deadline, default: 30000\n  --control-timeout-ms <1..86400000> Control/shutdown deadline, default: 5000\n\nText and pi-json modes record triggers only. RPC abort clears the queue, requests abort, checks idle state, and closes stdin.\nExit 3 means confirmed RPC abort and clean child exit; exit 2 means capture/adapter/control failure.\nRPC is cooperative cancellation, not an execution-before-use gate or process-tree guarantee.\nLogs default to runs/<run-id>.jsonl. Existing output files are never overwritten.";
 
 struct Options {
     rules: PathBuf,
     output: Option<PathBuf>,
     command: Vec<OsString>,
-    pi_json: bool,
+    format: &'static str,
+    prompt: Option<String>,
+    abort: bool,
+    timeout: Duration,
+    control_timeout: Duration,
 }
 
 fn parse_options() -> Result<Option<Options>, String> {
@@ -30,17 +38,39 @@ fn parse_options() -> Result<Option<Options>, String> {
     let mut rules = None;
     let mut output = None;
     let mut format = None;
+    let mut prompt = None;
+    let mut abort = false;
+    let mut timeout = Duration::from_secs(30);
+    let mut control_timeout = Duration::from_secs(5);
+    let mut rpc_options = HashSet::new();
     while let Some(arg) = args.next() {
         if arg == "--" {
             let command: Vec<_> = args.collect();
             if command.is_empty() {
                 return Err("a program is required after --".into());
             }
+            let format = format.unwrap_or("text");
+            if format == "pi-rpc" {
+                if prompt
+                    .as_ref()
+                    .is_none_or(|text: &String| text.trim().is_empty())
+                {
+                    return Err("--format pi-rpc requires a nonempty --prompt".into());
+                }
+            } else if !rpc_options.is_empty() {
+                return Err(
+                    "--prompt, --on-trigger and deadline options require --format pi-rpc".into(),
+                );
+            }
             return Ok(Some(Options {
                 rules: rules.ok_or("--rules is required")?,
                 output,
                 command,
-                pi_json: format.unwrap_or(false),
+                format,
+                prompt,
+                abort,
+                timeout,
+                control_timeout,
             }));
         }
         if arg == "--format" {
@@ -48,10 +78,53 @@ fn parse_options() -> Result<Option<Options>, String> {
                 return Err("duplicate option: --format".into());
             }
             format = Some(match args.next().as_deref() {
-                Some(value) if value == "text" => false,
-                Some(value) if value == "pi-json" => true,
-                _ => return Err("--format requires text or pi-json".into()),
+                Some(value) if value == "text" => "text",
+                Some(value) if value == "pi-json" => "pi-json",
+                Some(value) if value == "pi-rpc" => "pi-rpc",
+                _ => return Err("--format requires text, pi-json or pi-rpc".into()),
             });
+            continue;
+        }
+        if [
+            "--prompt",
+            "--on-trigger",
+            "--timeout-ms",
+            "--control-timeout-ms",
+        ]
+        .iter()
+        .any(|key| arg == *key)
+        {
+            if !rpc_options.insert(arg.clone()) {
+                return Err(format!("duplicate option: {}", arg.to_string_lossy()));
+            }
+            let value = args
+                .next()
+                .ok_or("missing option value")?
+                .into_string()
+                .map_err(|_| "RPC option must be UTF-8")?;
+            match arg.to_str().unwrap_or_default() {
+                "--prompt" => prompt = Some(value),
+                "--on-trigger" => {
+                    abort = match value.as_str() {
+                        "record" => false,
+                        "abort" => true,
+                        _ => return Err("--on-trigger requires record or abort".into()),
+                    }
+                }
+                _ => {
+                    let ms: u64 = value
+                        .parse()
+                        .map_err(|_| "deadline must be an integer in 1..86400000 ms")?;
+                    if !(1..=86_400_000).contains(&ms) {
+                        return Err("deadline must be in 1..86400000 ms".into());
+                    }
+                    if arg == "--timeout-ms" {
+                        timeout = Duration::from_millis(ms);
+                    } else {
+                        control_timeout = Duration::from_millis(ms);
+                    }
+                }
+            }
             continue;
         }
         let target = if arg == "--rules" {
@@ -104,13 +177,28 @@ fn record_triggers(
     journal: &mut Journal,
     triggers: Vec<Trigger>,
     sequence: u64,
+    control: &mut Option<RpcControl>,
+    control_failure: &mut Option<String>,
 ) -> io::Result<usize> {
     let count = triggers.len();
     for trigger in triggers {
-        journal.emit(
+        let action = if control
+            .as_ref()
+            .is_some_and(|control| control.abort_on_trigger)
+        {
+            "abort"
+        } else {
+            "record"
+        };
+        let trigger_sequence = journal.emit(
             "rule_triggered",
-            json!({"trigger": trigger, "matched_event_sequence": sequence, "action": "record"}),
+            json!({"trigger": trigger, "matched_event_sequence": sequence, "action": action}),
         )?;
+        if let Some(control) = control
+            && let Err(error) = control.trigger(trigger_sequence, journal)
+        {
+            *control_failure = Some(error.to_string());
+        }
         eprintln!(
             "[inhibitor-lab] rule triggered: {} ({} matches)",
             trigger.rule_id,
@@ -126,6 +214,10 @@ fn record_triggers(
 enum Capture {
     Line(Source, CapturedLine),
     Error(Source, String),
+    Closed,
+    CommandWritten(Value),
+    InputError(String),
+    InputClosed,
 }
 
 fn capture(reader: impl Read, source: Source, sender: SyncSender<Capture>) {
@@ -137,13 +229,14 @@ fn capture(reader: impl Read, source: Source, sender: SyncSender<Capture>) {
                     return;
                 }
             }
-            Ok(None) => return,
+            Ok(None) => break,
             Err(error) => {
                 let _ = sender.send(Capture::Error(source, error.to_string()));
-                return;
+                break;
             }
         }
     }
+    let _ = sender.send(Capture::Closed);
 }
 
 /// Clean up the direct child if the collector itself fails. Full process-tree control is future work.
@@ -159,11 +252,13 @@ impl Drop for ManagedChild {
 }
 
 fn run(options: Options) -> Result<i32, Box<dyn std::error::Error>> {
+    let pi_json = options.format != "text";
+    let pi_rpc = options.format == "pi-rpc";
     let mut rules = RuleEngine::from_json(&fs::read_to_string(&options.rules)?)?;
-    if rules.requires_agent_events() && !options.pi_json {
-        return Err("event rules require --format pi-json".into());
+    if rules.requires_agent_events() && !pi_json {
+        return Err("event rules require --format pi-json or pi-rpc".into());
     }
-    let mut adapter = options.pi_json.then(PiAdapter::default);
+    let mut adapter = pi_json.then(PiAdapter::default);
     let mut adapter_complete = true;
     let run_id = format!("{}-{}", now_ms(), std::process::id());
     let output = options
@@ -184,7 +279,11 @@ fn run(options: Options) -> Result<i32, Box<dyn std::error::Error>> {
     let program = &options.command[0];
     let spawn_result = Command::new(program)
         .args(&options.command[1..])
-        .stdin(Stdio::inherit())
+        .stdin(if pi_rpc {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn();
@@ -200,17 +299,66 @@ fn run(options: Options) -> Result<i32, Box<dyn std::error::Error>> {
     };
     journal.emit(
         "run_started",
-        json!({"program": program.to_string_lossy(), "pid": child.0.id(), "format": if options.pi_json { "pi-json" } else { "text" }}),
+        json!({"program": program.to_string_lossy(), "pid": child.0.id(), "format": options.format}),
     )?;
     let stdout = child.0.stdout.take().ok_or("missing stdout pipe")?;
     let stderr = child.0.stderr.take().ok_or("missing stderr pipe")?;
     let (sender, receiver) = sync_channel(256);
+    let mut control = if pi_rpc {
+        Some(RpcControl::new(
+            child.0.stdin.take().ok_or("missing stdin pipe")?,
+            sender.clone(),
+            options.timeout,
+            options.control_timeout,
+            options.abort,
+        ))
+    } else {
+        None
+    };
     let stdout_sender = sender.clone();
     let stdout_thread = thread::spawn(move || capture(stdout, Source::Stdout, stdout_sender));
     let stderr_thread = thread::spawn(move || capture(stderr, Source::Stderr, sender));
     let mut capture_failed = false;
     let mut trigger_count = 0;
-    for captured in receiver {
+    let mut control_failure = None;
+    let mut forced_cleanup = false;
+    let mut closed_streams = 0;
+    let mut input_closed = false;
+    if let Some(control) = &mut control {
+        control.prompt(
+            options.prompt.as_deref().ok_or("missing RPC prompt")?,
+            &mut journal,
+        )?;
+    }
+    loop {
+        if control.as_ref().is_some_and(RpcControl::expired) && control_failure.is_none() {
+            control_failure = Some("RPC run or control/shutdown deadline exceeded".into());
+        }
+        if let Some(error) = &control_failure {
+            journal.emit(
+                "control_failed",
+                json!({"error": error, "cleanup_scope": "direct_child"}),
+            )?;
+            if child.0.try_wait()?.is_none() {
+                child.0.kill()?;
+            }
+            forced_cleanup = true;
+            capture_failed = true; // The deadline can interrupt draining; do not claim complete output.
+            break;
+        }
+        if control
+            .as_ref()
+            .is_some_and(|control| !control.closing || input_closed)
+            && closed_streams == 2
+            && child.0.try_wait()?.is_some()
+        {
+            break;
+        }
+        let captured = match receiver.recv_timeout(Duration::from_millis(25)) {
+            Ok(captured) => captured,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
         match captured {
             Capture::Line(
                 source,
@@ -234,19 +382,30 @@ fn run(options: Options) -> Result<i32, Box<dyn std::error::Error>> {
                     Source::Stderr => writeln!(io::stderr().lock(), "{display_text}")?,
                 }
                 if truncated {
-                    if options.pi_json && source == Source::Stdout {
+                    if pi_json && source == Source::Stdout {
                         adapter_complete = false;
                         journal.emit("adapter_error", json!({"adapter": "pi", "raw_event_sequence": sequence, "error": "truncated Pi record; skipped"}))?;
+                        if pi_rpc {
+                            control_failure = Some("truncated RPC record".into());
+                        }
                     }
                     continue;
                 }
-                if options.pi_json && source == Source::Stdout && invalid_utf8 {
+                if pi_json && source == Source::Stdout && invalid_utf8 {
                     adapter_complete = false;
                     journal.emit("adapter_error", json!({"adapter": "pi", "raw_event_sequence": sequence, "error": "invalid UTF-8 Pi record; skipped"}))?;
+                    if pi_rpc {
+                        control_failure = Some("invalid UTF-8 RPC record".into());
+                    }
                     continue;
                 }
-                trigger_count +=
-                    record_triggers(&mut journal, rules.observe(source, &text), sequence)?;
+                trigger_count += record_triggers(
+                    &mut journal,
+                    rules.observe(source, &text),
+                    sequence,
+                    &mut control,
+                    &mut control_failure,
+                )?;
                 if source == Source::Stdout
                     && let Some(adapter) = &mut adapter
                 {
@@ -257,38 +416,95 @@ fn run(options: Options) -> Result<i32, Box<dyn std::error::Error>> {
                                 &mut journal,
                                 rules.observe_event(source, &event),
                                 normalized,
+                                &mut control,
+                                &mut control_failure,
                             )?;
                         }
                         Ok(None) => {}
                         Err(error) => {
                             adapter_complete = false;
                             journal.emit("adapter_error", json!({"adapter": "pi", "raw_event_sequence": sequence, "error": error}))?;
+                            if pi_rpc {
+                                control_failure = Some("invalid RPC record".into());
+                            }
                         }
                     }
+                }
+                if source == Source::Stdout
+                    && control_failure.is_none()
+                    && let Some(control) = &mut control
+                    && let Err(error) = control.observe(&text, sequence, &mut journal)
+                {
+                    control_failure = Some(error.to_string());
                 }
             }
             Capture::Error(source, error) => {
                 capture_failed = true;
                 journal.emit("capture_failed", json!({"source": source, "error": error}))?;
+                if pi_rpc {
+                    control_failure = Some("RPC output capture failed".into());
+                }
+            }
+            Capture::Closed => closed_streams += 1,
+            Capture::CommandWritten(id) => {
+                journal.emit("rpc_command_written", json!({"id": id}))?;
+            }
+            Capture::InputClosed => {
+                input_closed = true;
+                journal.emit("rpc_input_closed", json!({}))?;
+            }
+            Capture::InputError(error) => {
+                control_failure = Some(format!("RPC stdin failed: {error}"))
             }
         }
     }
-    for reader in [stdout_thread, stderr_thread] {
+    // Deadline failures detach readers: a descendant holding a pipe must not defeat the deadline.
+    for reader in [stdout_thread, stderr_thread]
+        .into_iter()
+        .filter(|_| !forced_cleanup)
+    {
         if reader.join().is_err() {
             capture_failed = true;
             journal.emit("capture_failed", json!({"error": "reader thread panicked"}))?;
         }
     }
     let status = child.0.wait()?;
-    journal.emit("run_finished", json!({"exit_code": status.code(), "success": status.success(), "trigger_count": trigger_count, "capture_complete": !capture_failed, "adapter_complete": adapter_complete}))?;
+    if let Some(control) = &control
+        && control_failure.is_none()
+    {
+        if !control.closing {
+            control_failure = Some("Pi exited before RPC completion was confirmed".into());
+        } else if !status.success() || capture_failed || !adapter_complete {
+            control_failure =
+                Some("Pi shutdown or output collection failed after protocol completion".into());
+        }
+        if control_failure.is_some() {
+            journal.emit("control_failed", json!({"error": control_failure}))?;
+        }
+    }
+    let aborted = control.as_ref().is_some_and(|control| control.confirmed);
+    let control_outcome = if control.is_none() {
+        "not_enabled"
+    } else if control_failure.is_some() || !status.success() {
+        "failed"
+    } else if aborted {
+        "aborted"
+    } else {
+        "completed"
+    };
+    journal.emit("run_finished", json!({"exit_code": status.code(), "success": status.success(), "trigger_count": trigger_count, "capture_complete": !capture_failed, "adapter_complete": adapter_complete, "control_outcome": control_outcome, "forced_cleanup": forced_cleanup}))?;
     if !adapter_complete {
         eprintln!("[inhibitor-lab] Pi input was incomplete or invalid; see adapter_error events");
     }
-    Ok(if capture_failed || !adapter_complete {
-        2
-    } else {
-        status.code().unwrap_or(1)
-    })
+    Ok(
+        if capture_failed || !adapter_complete || control_outcome == "failed" {
+            2
+        } else if aborted {
+            3
+        } else {
+            status.code().unwrap_or(1)
+        },
+    )
 }
 
 fn main() {

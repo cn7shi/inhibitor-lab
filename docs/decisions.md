@@ -1,5 +1,22 @@
 # 决策记录
 
+## D009：修复 Windows RPC 退出的运行时条件，保留失败证据（2026-10-05）
+
+- 实测：Node 24.17.0 下真实 Pi 两次中止均返回成功响应和空闲状态，但关闭 stdin 后出现 `UV_HANDLE_CLOSING` 断言，子进程退出码 `-1073740791`；启动器返回 2，最终 `control_outcome: failed`。
+- 依据：Node [24.20.0 发布记录](https://nodejs.org/en/blog/release/v24.20.0) 明确包含 [#61999](https://github.com/nodejs/node/pull/61999) 的 Windows libuv 退出修复；Pi 上游 [#9507](https://github.com/earendil-works/pi/issues/9507) 也报告相同 RPC 关闭症状。当前根因判断是基于症状和上游修复的推断，需升级后的对照验证支持。
+- 选择：依照用户的环境管理要求，通过 Scoop 安装修复版本 Node 24.20.0；保留旧版本，不改 Pi 依赖代码、不加入任意等待来掩盖崩溃。实验与 CI 固定同一版本便于复现。
+- 结果：Scoop 安装及哈希校验通过，24.17.0 仍保留，npm 全局前缀不变；更新后仅记录 / 中止对照全部通过。结果支持上述运行时判断，但没有声称独立完成 Node 原生栈根因证明。
+
+## D008：显式启用 RPC 中止，按证据区分请求、空闲与退出（2026-10-05）
+
+- 选择：扩展 `run --format pi-rpc --prompt <文本> --on-trigger record|abort`；默认仍仅记录。RPC 独占子进程 stdin，单次发送一个提示，其它模式继承 stdin。
+- 控制顺序：首次规则触发关联证据后发送 `clear_queue`，成功后发送 `abort`，成功后 `get_state`；仅接受匹配命令 ID、命令名和成功标记的响应。需要空闲且没有排队任务，随后关闭 stdin 请求进程退出。
+- 理由：Pi 文档说明 `abort` 不会自动清除排队消息；`agent_end` 也不能证明没有后续工作。自然完成使用 `agent_settled`，中止使用响应与空闲状态证据，最终保留真实退出码。
+- 期限：RPC 默认总运行期限 30 秒，控制或关闭收尾期限 5 秒，可显式配置；使用单调时钟。向 stdin 写入由独立线程负责，使不读取 stdin 的子进程不能卡住控制期限检查。
+- 结果：正常完成保留子进程退出码；确认中止且进程正常退出时启动器返回 3，区别于普通成功；采集 / 适配 / 控制异常返回 2，强制结束直接子进程只属于异常清理。
+- 取舍：这是合作式事后中止，有事件传输和命令处理的竞态，不能保证第三次工具从未开始，更不能撤销已完成动作。真实测试用受控延迟隔离中止路径，同时记录窗口中出现的工具调用。
+- 来源：[RPC 生命周期与关闭](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc.md)、[abort 与 clear_queue](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc-commands.md#abort)。
+
 ## D001：先验证信息与规则，再讨论智能判断（2026-10-05 补记）
 
 - 来源：用户明确要求“判错先放一边”，先获取信息并触发简单规则。

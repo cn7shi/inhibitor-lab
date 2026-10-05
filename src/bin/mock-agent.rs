@@ -1,7 +1,84 @@
-use std::io::{self, Write};
+use serde_json::{Value, json};
+use std::io::{self, BufRead, Write};
+
+fn emit(value: Value) {
+    println!("{value}");
+    io::stdout().flush().unwrap();
+}
+
+fn rpc(scenario: &str) {
+    if scenario == "rpc-no-stdin" {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        return;
+    }
+    for line in io::stdin().lock().lines() {
+        let command: Value = serde_json::from_str(&line.unwrap()).unwrap();
+        let kind = command["type"].as_str().unwrap();
+        let mut response =
+            json!({"type":"response", "id":command["id"], "command":kind, "success":true});
+        match kind {
+            "prompt" => {
+                response["data"] = json!({"disposition":"started"});
+                emit(response);
+                emit(json!({"type":"agent_start"}));
+                for id in if scenario == "rpc-natural" {
+                    vec!["one"]
+                } else {
+                    vec!["one", "one", "two"]
+                } {
+                    emit(
+                        json!({"type":"tool_execution_end", "toolCallId":id, "toolName":"read", "isError":true}),
+                    );
+                }
+                emit(json!({"type":"agent_end", "willRetry":true}));
+                if scenario == "rpc-premature" {
+                    return;
+                }
+                if ["rpc-natural", "rpc-record"].contains(&scenario) {
+                    emit(json!({"type":"agent_settled"}));
+                }
+            }
+            "clear_queue" => {
+                if ["rpc-ignore", "rpc-ended-only"].contains(&scenario) {
+                    continue;
+                }
+                if scenario == "rpc-race" {
+                    emit(
+                        json!({"type":"tool_execution_start", "toolCallId":"in-flight", "toolName":"read"}),
+                    );
+                }
+                emit(response);
+            }
+            "abort" => {
+                if scenario == "rpc-reject" {
+                    response["success"] = json!(false);
+                    response["error"] = json!("mock abort rejected");
+                } else {
+                    emit(json!({"type":"agent_settled"}));
+                }
+                emit(response);
+            }
+            "get_state" => {
+                response["data"] = json!({"isStreaming": scenario == "rpc-active", "isCompacting": false, "pendingMessageCount":0});
+                if scenario == "rpc-wrong-id" {
+                    response["id"] = json!("foreign-response");
+                }
+                if scenario == "rpc-wrong-command" {
+                    response["command"] = json!("different-command");
+                }
+                emit(response);
+            }
+            _ => panic!("unexpected test command {kind}"),
+        }
+    }
+    if scenario == "rpc-bad-exit" {
+        std::process::exit(7);
+    }
+}
 
 fn main() {
     match std::env::args().nth(1).as_deref().unwrap_or("repeat") {
+        scenario if scenario.starts_with("rpc-") => rpc(scenario),
         "normal" => {
             println!("INFO starting task");
             eprintln!("INFO diagnostic stream is not automatically an error");

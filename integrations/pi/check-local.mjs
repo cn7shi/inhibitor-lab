@@ -11,13 +11,17 @@ import { captureOutput } from "./capture-output.mjs";
 import { stopRun } from "./process-cleanup.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
+const mode = process.argv[2] ?? "json";
+assert.ok(["json", "rpc-record", "rpc-abort"].includes(mode), "Expected json, rpc-record or rpc-abort");
+const rpc = mode !== "json";
+const abort = mode === "rpc-abort";
 const root = resolve(here, "../..");
 const piPackage = join(here, "node_modules/@earendil-works/pi-coding-agent");
 const { version, bin } = JSON.parse(await readFile(join(piPackage, "package.json"), "utf8"));
 assert.equal(version, "1.0.3", "Use npm ci to install the pinned Pi version");
 const launcher = join(root, "target/debug", process.platform === "win32" ? "inhibitor-lab.exe" : "inhibitor-lab");
 await mkdir(join(root, "runs"), { recursive: true });
-const run = await mkdtemp(join(root, "runs/pi-local-"));
+const run = await mkdtemp(join(root, rpc ? `runs/pi-${mode}-` : "runs/pi-local-"));
 const cwd = join(run, "workspace");
 const agentDir = join(run, "pi-config");
 await mkdir(cwd);
@@ -46,6 +50,15 @@ const server = createServer(async (request, response) => {
     const step = results.length;
     assert.ok(step <= 3 && requests.length < 5, "Unexpected tool loop or retry");
     requests.push({ step, toolResults: results.length });
+    // The record/abort comparison uses the same pause before a third tool call.
+    // It isolates cooperative cancellation; it does not prove a zero-latency gate.
+    if (rpc && step === 2) {
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, 1000);
+        response.once("close", () => { clearTimeout(timer); resolve(); });
+      });
+      if (response.destroyed) return;
+    }
     response.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
     const send = (delta, finishReason = null) => response.write(`data: ${JSON.stringify({
       id: `fixture-${step}`, object: "chat.completion.chunk", created: 0, model: "deterministic",
@@ -87,12 +100,14 @@ try {
   await writeFile(join(agentDir, "settings.json"), JSON.stringify({
     retry: { enabled: false }, compaction: { enabled: false },
   }));
-  const args = ["run", "--format", "pi-json", "--rules", join(root, "examples/pi-rules.json"),
-    "--out", journal, "--", process.execPath, join(piPackage, bin.pi),
-    "--mode", "json", "--provider", "inhibitor-local", "--model", "deterministic",
+  const prompt = "Read missing-a.txt, missing-b.txt, and present.txt once each, then finish.";
+  const args = ["run", "--format", rpc ? "pi-rpc" : "pi-json", "--rules", join(root, "examples/pi-rules.json"),
+    "--out", journal,
+    ...(rpc ? ["--prompt", prompt, "--on-trigger", abort ? "abort" : "record", "--timeout-ms", "20000"] : []),
+    "--", process.execPath, join(piPackage, bin.pi),
+    "--mode", rpc ? "rpc" : "json", "--provider", "inhibitor-local", "--model", "deterministic",
     "--thinking", "off", "--offline", "--no-extensions", "--no-skills", "--no-prompt-templates",
-    "--no-session", "--tools", "read",
-    "Read missing-a.txt, missing-b.txt, and present.txt once each, then finish."];
+    "--no-session", "--tools", "read", ...(rpc ? [] : [prompt])];
   const child = spawn(launcher, args, {
     cwd, env: { ...process.env, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1" },
     windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
@@ -103,17 +118,18 @@ try {
     stop: () => stopRun(child, journal),
   });
   assert.deepEqual(serverErrors, [], `Fixture failed; see ${run}`);
-  assert.equal(exitCode, 0, `Launcher/Pi failed; see ${join(run, "stderr.log")}`);
-  assert.deepEqual(requests.map((request) => request.step), [0, 1, 2, 3]);
+  assert.equal(exitCode, abort ? 3 : 0, `Launcher/Pi failed; see ${join(run, "stderr.log")}`);
+  if (abort) assert.ok(["0,1", "0,1,2"].includes(requests.map((request) => request.step).join(",")));
+  else assert.deepEqual(requests.map((request) => request.step), [0, 1, 2, 3]);
   const events = await readEvents();
   const tools = events.filter((event) => event.kind === "agent_event");
-  assert.deepEqual(tools.map((event) => event.data.event.failed), [true, true, false]);
+  assert.deepEqual(tools.map((event) => event.data.event.failed), abort ? [true, true] : [true, true, false]);
   assert.ok(tools.every((event) => event.data.event.tool_name === "read"));
   const triggers = events.filter((event) => event.kind === "rule_triggered");
   assert.equal(triggers.length, 1);
   assert.equal(triggers[0].data.trigger.matched_events, 2);
   assert.equal(triggers[0].data.matched_event_sequence, tools[1].sequence);
-  assert.equal(triggers[0].data.action, "record");
+  assert.equal(triggers[0].data.action, abort ? "abort" : "record");
   for (const event of tools) {
     const raw = events.find((candidate) => candidate.sequence === event.data.raw_event_sequence);
     assert.equal(raw.kind, "output");
@@ -128,10 +144,34 @@ try {
   assert.equal(events.at(-1).data.adapter_complete, true);
   assert.equal(events.at(-1).data.capture_complete, true);
   assert.equal(events.at(-1).data.exit_code, 0);
-  assert.ok(tools[2].sequence > triggers[0].sequence, "Pi must continue after a record-only trigger");
+  assert.equal(events.at(-1).data.forced_cleanup, false);
+  assert.equal(events.at(-1).data.control_outcome, rpc ? (abort ? "aborted" : "completed") : "not_enabled");
+  if (!abort) assert.ok(tools[2].sequence > triggers[0].sequence, "Pi must continue after a record-only trigger");
+  let confirmation;
+  if (rpc) {
+    const commands = events.filter((event) => event.kind === "rpc_command_requested");
+    assert.deepEqual(commands.map((event) => event.data.command), abort ? ["prompt", "clear_queue", "abort", "get_state"] : ["prompt"]);
+    for (const command of commands) {
+      assert.ok(events.some((event) => event.kind === "rpc_response" && event.data.id === command.data.id
+        && event.data.command === command.data.command && event.data.success === true));
+    }
+    assert.ok(events.some((event) => event.kind === "rpc_input_closed"));
+    if (abort) {
+      confirmation = events.find((event) => event.kind === "control_confirmed");
+      assert.equal(confirmation.data.trigger_sequence, triggers[0].sequence);
+      const state = JSON.parse(events.find((event) => event.sequence === confirmation.data.raw_event_sequence).data.text).data;
+      assert.equal(state.isStreaming, false);
+      assert.equal(state.isCompacting, false);
+      assert.equal(state.pendingMessageCount, 0);
+      assert.equal(events.filter((event) => event.kind === "tool_started_after_trigger").length, 0);
+    }
+  }
   const summary = {
-    pi_version: version, model_mode: "local-deterministic-fixture", real_model_validated: false,
-    tool_results: 3, tool_failures: 2, rule_triggers: 1, exit_code: exitCode,
+    pi_version: version, node_version: process.version, model_mode: "local-deterministic-fixture", real_model_validated: false,
+    mode, tool_results: tools.length, tool_failures: 2, rule_triggers: 1, exit_code: exitCode,
+    child_exit_code: events.at(-1).data.exit_code, control_outcome: events.at(-1).data.control_outcome,
+    confirmation_sequence: confirmation?.sequence,
+    tool_starts_after_trigger: events.filter((event) => event.kind === "tool_started_after_trigger").length,
     raw_output_sequences: tools.map((event) => event.data.raw_event_sequence),
     normalized_sequences: tools.map((event) => event.sequence),
     trigger_sequence: triggers[0].sequence, evidence_sequence: triggers[0].data.matched_event_sequence,

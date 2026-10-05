@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "test": "node --test process-cleanup.test.mjs capture-output.test.mjs",
-    "check:local": "node check-local.mjs"
+    "check:local": "node check-local.mjs",
+    "check:rpc": "node check-local.mjs rpc-record && node check-local.mjs rpc-abort"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "1.0.3"

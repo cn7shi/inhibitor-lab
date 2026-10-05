@@ -2,7 +2,7 @@
 
 本地 Agent 错误治理的独立实验工程，使用 Rust 从头搭建。
 
-当前阶段验证：**启动进程 → 获取输出 → 转换工具结果 → 匹配显式规则 → 记录触发事件**。
+当前阶段验证：**启动进程 → 获取输出 → 转换工具结果 → 匹配显式规则 → 记录触发 → 可选 Pi RPC 中止**。
 
 ## 当前能力
 
@@ -10,17 +10,17 @@
 - 将采集到的文本转发到对应终端输出流。
 - 按输出来源、区分大小写的包含字符串和累计命中行数匹配规则。
 - 通过 `--format pi-json` 接收 Pi 事件，将工具结束结果转换为统一事件，按工具报告的成功/失败计数；同一调用 ID 去重。
-- 每条规则在一次运行中最多触发一次，动作固定为记录 `rule_triggered`。
+- 每条规则在一次运行中最多触发一次，默认记录 `rule_triggered`；显式启用 Pi RPC 中止时，首次触发启动一次控制流程。
 - 写入逐行 JSON 事件，保留运行 ID、事件序号、采集时间和触发依据。
-- 子进程继续运行，正常采集结束后保留它的退出码。
+- 观察模式让子进程继续运行并保留其退出码；RPC 模式额外记录控制结果。
 
-规则完全由配置决定；`stderr` 本身不代表错误。当前不判断错误语义，也不执行自动熔断、重试、恢复或修改模型上下文。
+规则完全由配置决定；`stderr` 本身不代表错误。当前不判断错误语义。Pi RPC 可在规则触发后请求中止，尚不提供执行前拦截、重试、恢复或上下文修复。
 
-开发过程见 [阶段记录](docs/development-log.md)、[决策记录](docs/decisions.md)，证据摘要见 [Pi 本地验证](docs/verification/pi-local.md)、[可靠性自查](docs/verification/self-review.md) 和 [OCR 委托审查](docs/verification/ocr-delegate.md)。
+开发过程见 [阶段记录](docs/development-log.md)、[决策记录](docs/decisions.md)，证据摘要见 [Pi 本地验证](docs/verification/pi-local.md)、[可靠性自查](docs/verification/self-review.md)、[OCR 委托审查](docs/verification/ocr-delegate.md) 和 [RPC 中止实验](docs/verification/pi-rpc.md)。
 
 ## Pi 本地验证（不需要模型账号）
 
-沿用 Scoop 安装的 Node.js；Pi 是项目内的 npm 开发依赖，固定为 `1.0.3`，不进行全局安装。需要 Node.js >= 22.19。
+沿用 Scoop 管理的 Node.js，本地与 CI 使用 **24.20.0**；Pi 是项目内的 npm 开发依赖，固定为 `1.0.3`，不进行全局安装。Windows 的 Node 24.17.0 曾在 RPC 中止后的进程退出阶段崩溃，升级后的对照结果见 RPC 报告。
 
 ```powershell
 npm ci --prefix integrations/pi --ignore-scripts --no-audit --no-fund --cache .npm-cache
@@ -41,6 +41,30 @@ npm --prefix integrations/pi run check:local
 ```
 
 Windows 下直接通过 Node 启动 Pi 的入口文件，避免依赖 `.cmd` 启动脚本。模型登录或环境变量由 Pi 自己管理，凭据不要写入规则文件或提交到仓库。
+
+## Pi RPC 中止实验
+
+```powershell
+npm --prefix integrations/pi run check:rpc
+```
+
+同一脚本依次运行仅记录和中止两种模式，使用相同的本机固定模型回复，在第三次工具调用前留出一秒响应窗口。仅记录模式完成三次读取；中止模式在两次失败后清空任务队列、请求中止、查询会话空闲状态，然后关闭 stdin 请求 Pi 正常退出。当前已验证第三次读取在这个受控中止实验中没有发生。
+
+这属于合作式事后中止。真实运行可能在收到中止命令前已开始下一次工具调用；RPC 模式用 `tool_started_after_trigger` 记录这种情况。中止无法撤销已完成动作，也不保证终止任意后代进程。
+
+独立运行形式如下，模型服务需先自行配置；这个形式尚未与真实模型联调：
+
+```powershell
+.\target\debug\inhibitor-lab.exe run --format pi-rpc --rules examples/pi-rules.json --prompt "读取指定的两个测试文件，然后结束" --on-trigger abort -- node integrations/pi/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js --mode rpc --no-session --no-extensions --tools read
+```
+
+- `--format pi-rpc`：启动器独占子进程 stdin，一次发送一个 `--prompt`。它不是透传交互式会话。
+- `--on-trigger record|abort`：默认 `record`；只有 `abort` 才请求中止。事件规则计数方式不变。
+- `--timeout-ms`：整个 RPC 实验期限，默认 30000；`--control-timeout-ms`：控制流程及随后关闭进程的各自期限，默认 5000。均接受 1 到 86400000 毫秒。
+- 自然完成须等 `agent_settled`（或提示被直接处理），`agent_end` 本身不够；所有命令响应按 ID 与命令名关联。
+- 正常完成返回子进程退出码；**确认中止且 Pi 正常退出，启动器返回 3**。采集、协议、控制、关闭异常返回 2。超过期限会尝试清理直接子进程，并标记失败；不会把强制清理当作中止成功。
+
+`check:rpc` 会验证启动器的预期退出码 3，因此整个实验脚本成功时仍返回 0，适合在 CI 中运行。
 
 ## 运行实验
 
@@ -70,7 +94,7 @@ cargo build --bins
 .\target\debug\inhibitor-lab.exe run --rules examples/rules.json --out runs/my-run.jsonl -- your-agent argument1 argument2
 ```
 
-输出文件已存在时会拒绝运行，保留已有记录。被启动的程序继承工作目录、环境变量和标准输入；命令通过参数直接启动，不经过额外的 shell。规则相对路径和输出相对路径都基于当前工作目录。
+输出文件已存在时会拒绝运行，保留已有记录。被启动的程序继承工作目录与环境变量；文本 / Pi JSON 模式继承标准输入，RPC 模式接管标准输入。命令通过参数直接启动，不经过额外的 shell。规则相对路径和输出相对路径都基于当前工作目录。
 
 ## 规则
 
@@ -85,7 +109,7 @@ cargo build --bins
 - `id`：非空、唯一。
 - `source`：`stdout`、`stderr` 或 `any`，省略时为 `any`。
 - `contains`：非空字符串，区分大小写。
-- `event`：结构化条件，与 `contains` 二选一；需启用 `--format pi-json`。
+- `event`：结构化条件，与 `contains` 二选一；需启用 `--format pi-json` 或 `pi-rpc`。
 - `threshold`：正整数，文本规则累计匹配行数，事件规则累计匹配事件数；一行出现多次关键词只计一次。
 - `rules: []`：只采集，不触发规则。
 
@@ -107,13 +131,17 @@ Pi 适配器仅解析 stdout 中的 `tool_execution_end`，严格要求非空 `t
 
 事件类型为 `run_started`、`output`、`agent_event`、`rule_triggered`、`run_finished`，异常时会记录 `spawn_failed`、`capture_failed` 或 `adapter_error`。
 
+RPC 增加 `rpc_command_requested`、`rpc_command_written`、`rpc_response`、`rpc_settled`、`control_confirmed`、`rpc_shutdown_requested`、`rpc_input_closed`、`control_failed` 与 `tool_started_after_trigger`。中止命令通过 `trigger_sequence` 关联触发，响应通过 `raw_event_sequence` 关联原始输出。`control_confirmed` 只证明协议中止与空闲状态；最终还须检查 `run_finished` 的退出和完整性信息。
+
+`run_finished.control_outcome` 为 `not_enabled`、`completed`、`aborted` 或 `failed`；`forced_cleanup` 标记是否进入异常清理路径。`completed` 表示本次协议运行结束，不是模型任务质量判断。实际子进程的 `exit_code` / `success` 始终保留，不用启动器的中止退出码 3 覆盖。
+
 `rule_triggered.data.matched_event_sequence` 指向本次触发对应的输出或统一事件；统一事件的 `data.raw_event_sequence` 再指向原始输出。文本规则记录 `matched_lines`，事件规则记录 `matched_events`。两个流各自保序，跨流序号表示采集顺序；时间戳表示采集时间，不承诺是子进程内的实际发生时间。
 
 每行最多保留 64 KiB，超长部分会被读完并丢弃，事件标记 `truncated: true`，该行不参与规则判断。文本按 UTF-8 解码，无效字节替换为替代字符，同时标记 `invalid_utf8: true`。普通文本模式维持替换解码后的匹配；Pi stdout 中的无效编码行不参与任何规则匹配。终端转发会规范化换行，因此本版本面向文本输出程序。事件队列最多缓存 256 行，写入缓慢时会对采集施加背压。
 
-Pi stdout 的无效 UTF-8、无效 JSON、缺失必填字段、冲突结果或截断记录会生成 `adapter_error`；后续记录继续采集，但结束时 `adapter_complete: false`，启动器返回 2。`run_finished.exit_code` / `success` 仍描述子进程本身，需同时检查 `capture_complete` 和 `adapter_complete`。大体积工具结果或汇总事件可能超过当前 64 KiB 上限，此时不会宣称采集适配完整。
+Pi stdout 的无效 UTF-8、无效 JSON、缺失必填字段、冲突结果或截断记录会生成 `adapter_error`；Pi JSON 观察模式继续采集，结束时 `adapter_complete: false`，启动器返回 2。RPC 模式在协议损坏后进入失败清理，不再据此确认控制成功。`run_finished.exit_code` / `success` 仍描述子进程本身，需同时检查 `capture_complete` 和 `adapter_complete`。大体积工具结果或汇总事件可能超过当前 64 KiB 上限，此时不会宣称采集适配完整。
 
-当前尚未接入本地日志文件跟随、MCP 代理、交互式终端、进程树熔断和人工恢复。若子进程将输出管道交给后台后代进程，采集可能需要等待这些后代关闭管道。
+当前尚未接入本地日志文件跟随、MCP 代理、交互式终端、进程树熔断和人工恢复。观察模式可能等待后台后代关闭继承的输出管道；RPC 异常期限到达后不再无限等待这些读取线程，但不承诺已经停止后代。终端转发和日志仍为同步 I/O，期限不是系统级硬实时保证。
 
 ## 验证
 
@@ -123,12 +151,13 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 npm --prefix integrations/pi test
 npm --prefix integrations/pi run check:local
+npm --prefix integrations/pi run check:rpc
 ```
 
-15 项 Rust 测试覆盖文本采集、规则、Pi 结果去重、假阳性排除、损坏输入、证据关联、退出码和已有日志保护；9 项 Node 测试检查半条日志下的进程清理、输出写入失败、超时及错误保留。另有 `check:local` 启动真实 Pi 验证完整链路，Windows CI 执行全部验证。
+24 项 Rust 测试覆盖文本采集、规则、Pi 结果去重、损坏输入、证据关联，以及 RPC 控制、异常响应、超时、退出和竞态记录；9 项 Node 测试检查半条日志下的进程清理、输出写入失败、超时及错误保留。`check:local` 和 `check:rpc` 启动真实 Pi 验证观察及控制链路，Windows CI 执行全部验证。
 
 ## 后续实验
 
 1. 配置用户选择的模型服务，验证真实模型运行时的事件。
-2. 单独验证 RPC 中止与执行前拦截，并明确它们的控制边界。
+2. 设计执行前拦截与人工恢复，避免把已验证的 RPC 中止当作硬拦截。
 3. 增加本地日志来源与 MCP 观测，处理不同来源之间的重复事件。

@@ -8,6 +8,7 @@ permissions:
 jobs:
   check:
     runs-on: windows-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
@@ -16,10 +17,11 @@ jobs:
       - run: cargo +stable clippy --locked --all-targets -- -D warnings
       - uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: 24.20.0
           cache: npm
           cache-dependency-path: integrations/pi/package-lock.json
       - run: npm ci --prefix integrations/pi --ignore-scripts --no-audit --no-fund
       - run: npm --prefix integrations/pi test
       - run: cargo +stable build --locked --bins
       - run: npm --prefix integrations/pi run check:local
+      - run: npm --prefix integrations/pi run check:rpc
