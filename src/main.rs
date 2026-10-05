@@ -13,12 +13,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod control;
 mod gate;
+mod inspect;
 use control::{Action, RpcControl};
 
 const HELP: &str = r#"inhibitor-lab: capture process output and emit explicit rule triggers
 
 Usage:
   inhibitor-lab run --rules <rules.json> [--format text|pi-json|pi-rpc] [--out <events.jsonl>] -- <program> [args...]
+  inhibitor-lab inspect --log <events.jsonl> [--format text|json]
+
+Inspect is read-only. Exit 0 means a valid diagnostic, not permission to restart.
+Invalid/incomplete/unsupported logs return 2. No resume command is implemented yet.
 
 RPC options (pi-rpc only):
   --prompt <text>                 Required single prompt sent over stdin
@@ -51,7 +56,7 @@ fn parse_options() -> Result<Option<Options>, String> {
         None => return Ok(None),
         Some(value) if value == "--help" || value == "-h" => return Ok(None),
         Some(value) if value == "run" => {}
-        _ => return Err("expected the run command; use --help".into()),
+        _ => return Err("expected run or inspect; use --help".into()),
     }
     let mut rules = None;
     let mut output = None;
@@ -571,6 +576,15 @@ fn run(options: Options) -> Result<i32, Box<dyn std::error::Error>> {
 }
 
 fn main() {
+    if env::args_os().nth(1).is_some_and(|arg| arg == "inspect") {
+        match inspect::command(env::args_os().skip(2)) {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                eprintln!("[inhibitor-lab] {error}");
+                std::process::exit(2);
+            }
+        }
+    }
     let result = match parse_options() {
         Ok(None) => {
             println!("{HELP}");

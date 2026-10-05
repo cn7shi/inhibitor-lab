@@ -1,6 +1,6 @@
 // Real Pi: distinguish prior batch admission from fresh admission, including nested calls.
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -115,7 +115,8 @@ async function runCase(scenario, action) {
       createWriteStream(join(run, "stderr.log")), { stop: () => stopRun(child, journal) });
     assert.deepEqual(serverErrors, [], `Fixture failed: ${run}`);
     assert.equal(exitCode, block ? 3 : 0, `Launcher failed; see ${run}`);
-    const events = (await readFile(journal, "utf8")).split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    const journalBytes = await readFile(journal);
+    const events = journalBytes.toString("utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
     const ofKind = (kind) => events.filter((event) => event.kind === kind);
     const raw = ofKind("output").filter((e) => e.data.source === "stdout")
       .map((e) => ({ sequence: e.sequence, value: JSON.parse(e.data.text) }));
@@ -183,12 +184,26 @@ async function runCase(scenario, action) {
       await checkEffect("batch-later.txt", !block);
       await checkEffect("batch-retry.txt", !block);
     }
+    const diagnosis = spawnSync(launcher, ["inspect", "--log", journal, "--format", "json"], {
+      encoding: "utf8", timeout: 5000, maxBuffer: 1024 * 1024, windowsHide: true,
+    });
+    assert.ifError(diagnosis.error);
+    assert.equal(diagnosis.status, 0, `Inspection failed: ${diagnosis.stdout}\n${diagnosis.stderr}`);
+    const inspection = JSON.parse(diagnosis.stdout);
+    assert.equal(inspection.status, "valid");
+    assert.equal(inspection.run_id, events[0].run_id);
+    assert.equal(inspection.eligible_for_manual_restart, block);
+    assert.equal(inspection.confirmed_blocked_tools, block ? 2 : 0);
+    assert.equal(inspection.triggers[0].evidence_sequence, triggers[0].data.matched_event_sequence);
+    assert.deepEqual(await readFile(journal), journalBytes, "Inspection must preserve the original log bytes");
+    await writeFile(join(run, "inspection.json"), `${JSON.stringify(inspection, null, 2)}\n`);
     const summary = {
       pi_version: version, node_version: process.version, scenario, action,
       model_mode: "local-deterministic-fixture", real_model_validated: false, artificial_delay_ms: 0,
       requests, files, ...finished.data, child_exit_code: finished.data.exit_code, exit_code: exitCode,
       trigger_sequence: triggers[0].sequence, evidence_sequence: triggers[0].data.matched_event_sequence,
       decisions: decisions.map((e) => ({ sequence: e.sequence, ...e.data })), parent_links: parentLinks,
+      eligible_for_manual_restart: inspection.eligible_for_manual_restart,
     };
     await writeFile(join(run, "summary.json"), `${JSON.stringify(summary, null, 2)}\n`);
     console.log(JSON.stringify({ ...summary, evidence_directory: run }, null, 2));

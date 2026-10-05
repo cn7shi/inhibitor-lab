@@ -2,7 +2,7 @@
 
 本地 Agent 错误治理的独立实验工程，使用 Rust 从头搭建。
 
-首次阅读或交接给其他 Agent，请先看 [项目导读与源码教程](tutorial.md)：项目意图、演进理由、六课阅读路线、证据解释与人工恢复设计都从这一个文件进入。
+首次阅读或交接给其他 Agent，请先看 [项目导读与源码教程](tutorial.md)：项目意图、演进理由、七课阅读路线、证据解释与人工恢复设计都从这一个文件进入。
 
 当前阶段验证：**启动进程 → 获取输出 → 转换工具结果 → 匹配显式规则 → 记录触发 → 可选 Pi RPC 中止或工具准入拦截**。
 
@@ -16,10 +16,24 @@
 - 显式加载 Pi 工具准入扩展时，每次工具调用等待放行；`block` 动作在规则触发后拒绝新的准入请求。
 - 写入逐行 JSON 事件，保留运行 ID、事件序号、采集时间和触发依据。
 - 观察模式让子进程继续运行并保留其退出码；RPC 模式额外记录控制结果。
+- 只读诊断已有日志，关联触发、准入决定、应用确认与收尾，说明是否满足后续人工继续的日志条件。
 
 规则完全由配置决定；`stderr` 本身不代表错误。当前不判断错误语义。Pi RPC 可请求中止，配合自有扩展可关闭新工具准入；已经放行的并发工具不能撤销。尚不提供重试、人工恢复或上下文修复。
 
 开发过程见 [阶段记录](docs/development-log.md)、[决策记录](docs/decisions.md)，证据摘要见 [Pi 本地验证](docs/verification/pi-local.md)、[可靠性自查](docs/verification/self-review.md)、[OCR 委托审查](docs/verification/ocr-delegate.md)、[RPC 中止实验](docs/verification/pi-rpc.md)、[工具准入实验](docs/verification/pi-gate.md) 和 [并发与嵌套边界](docs/verification/pi-boundaries.md)。
+
+## 查看一次运行为什么被拦截
+
+构建后，指定已有日志（将示例中的目录换成实验实际输出的目录）：
+
+```powershell
+.\target\debug\inhibitor-lab.exe inspect --log runs/<某次实验>/events.jsonl
+.\target\debug\inhibitor-lab.exe inspect --log runs/<某次实验>/events.jsonl --format json
+```
+
+默认中文摘要，显示规则、阈值、证据序号、门是否关闭、确认拒绝数和退出完整性。JSON 字段 `eligible_for_manual_restart` 仅表示日志满足首版继续条件；还没有实现人工确认及 `resume`。本命令不修改日志、不启动 Agent、不执行日志里的程序名。
+
+`inspect` 返回 0 表示诊断有效，即使 record / abort 等不满足继续条件；损坏、未知版本、未结束、超限或读取失败返回 2。不能用退出 0 代替人工许可。限额为 32 MiB 文件、1 MiB 单行、100,000 条记录；较早日志缺少关键字段也会明确拒绝。详见 [诊断验证与限制](docs/verification/inspect.md)。
 
 ## Pi 本地验证（不需要模型账号）
 
@@ -197,10 +211,10 @@ npm --prefix integrations/pi run check:gate
 npm --prefix integrations/pi run check:boundaries
 ```
 
-31 项 Rust 测试覆盖文本采集、规则、Pi 结果去重、损坏输入、证据关联，以及 RPC 控制、准入确认、关闭后请求重放、异常响应、超时、退出和竞态记录；14 项 Node 测试检查进程清理、输出写入失败、超时、错误保留及扩展拒绝行为（含并发迟到批准）。`check:local`、`check:rpc`、`check:gate` 和 `check:boundaries` 启动真实 Pi 验证观察、中止及准入边界，Windows CI 执行全部验证。
+43 项 Rust 测试覆盖文本采集、规则、Pi 结果去重、损坏输入、证据关联，以及 RPC 控制、准入确认、关闭后请求重放、异常响应、超时、退出、竞态记录和只读诊断的伪证据 / 截断 / 时序回归；14 项 Node 测试检查进程清理、输出写入失败、超时、错误保留及扩展拒绝行为（含并发迟到批准）。`check:local`、`check:rpc`、`check:gate` 和 `check:boundaries` 启动真实 Pi 验证观察、中止及准入边界；最后一个脚本还验证只读诊断和原日志字节不变。Windows CI 执行全部验证。
 
 ## 后续实验
 
 1. 配置用户选择的模型服务，验证真实模型运行时的事件。
-2. 按 [导读中的人工恢复方案](tutorial.md) 实现只读诊断、明确确认和关联的新运行；用户已选择这个形态，命令尚未实现。限制提前放行的调度策略另行评估。
+2. 按 [导读中的人工恢复方案](tutorial.md) 实现新配置确认和关联的新运行；只读 `inspect` 已完成，R2–R4 尚未实现。限制提前放行的调度策略另行评估。
 3. 增加本地日志来源与 MCP 观测，处理不同来源之间的重复事件。
