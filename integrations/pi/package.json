@@ -3,9 +3,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test process-cleanup.test.mjs capture-output.test.mjs",
+    "test": "node --test process-cleanup.test.mjs capture-output.test.mjs tool-gate.test.mjs",
     "check:local": "node check-local.mjs",
-    "check:rpc": "node check-local.mjs rpc-record && node check-local.mjs rpc-abort"
+    "check:rpc": "node check-local.mjs rpc-record && node check-local.mjs rpc-abort",
+    "check:gate": "node check-local.mjs gate-record && node check-local.mjs gate-block"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "1.0.3"

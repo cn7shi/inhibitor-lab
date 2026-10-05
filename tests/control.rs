@@ -31,8 +31,13 @@ fn execute(scenario: &str, action: &str, rules: &str, prompt: &str) -> (Output, 
             "3000",
             "--control-timeout-ms",
             "1000",
-            "--",
         ])
+        .args(if scenario.starts_with("gate-") {
+            &["--tool-gate"][..]
+        } else {
+            &[][..]
+        })
+        .arg("--")
         .arg(env!("CARGO_BIN_EXE_mock-agent"))
         .arg(scenario)
         .output()
@@ -229,4 +234,180 @@ fn tools_started_during_abort_are_recorded_as_a_control_race() {
             .count(),
         1
     );
+}
+
+#[test]
+fn gate_blocks_new_admission_with_correlated_application_evidence() {
+    let (output, events) = execute("gate-block", "block", RULES, "test");
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(commands(&events), ["get_commands", "prompt"]);
+    let decisions: Vec<_> = events
+        .iter()
+        .filter(|e| e["kind"] == "gate_decision")
+        .collect();
+    let applied: Vec<_> = events
+        .iter()
+        .filter(|e| e["kind"] == "gate_applied")
+        .collect();
+    assert_eq!(
+        decisions
+            .iter()
+            .map(|e| e["data"]["allowed"].as_bool().unwrap())
+            .collect::<Vec<_>>(),
+        [true, true, false]
+    );
+    assert_eq!(applied.len(), decisions.len());
+    for (decision, application) in decisions.iter().zip(applied) {
+        assert_eq!(
+            application["data"]["decision_sequence"],
+            decision["sequence"]
+        );
+        assert_eq!(application["data"]["allowed"], decision["data"]["allowed"]);
+    }
+    assert_eq!(
+        events.iter().filter(|e| e["kind"] == "agent_event").count(),
+        2
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["kind"] == "tool_blocked_result")
+            .count(),
+        1
+    );
+    let closed = events.iter().find(|e| e["kind"] == "gate_closed").unwrap();
+    let trigger = events
+        .iter()
+        .find(|e| e["kind"] == "rule_triggered")
+        .unwrap();
+    assert_eq!(closed["data"]["trigger_sequence"], trigger["sequence"]);
+    assert_eq!(
+        decisions[2]["data"]["trigger_sequence"],
+        trigger["sequence"]
+    );
+    let ready = events
+        .iter()
+        .position(|e| e["kind"] == "gate_ready")
+        .unwrap();
+    let prompt = events
+        .iter()
+        .position(|e| e["kind"] == "rpc_command_requested" && e["data"]["command"] == "prompt")
+        .unwrap();
+    assert!(ready < prompt);
+    let finished = &events.last().unwrap()["data"];
+    assert_eq!(finished["control_outcome"], "blocked");
+    assert_eq!(finished["blocked_tool_count"], 1);
+    assert_eq!(finished["exit_code"], 0);
+    assert_eq!(finished["forced_cleanup"], false);
+}
+
+#[test]
+fn gate_record_allows_tools_and_closure_alone_is_not_reported_as_a_block() {
+    for (scenario, action, exit, outcome, results) in [
+        ("gate-record", "record", 0, "completed", 3),
+        ("gate-no-next", "block", 3, "gate_closed", 2),
+    ] {
+        let (output, events) = execute(scenario, action, RULES, "test");
+        assert_eq!(output.status.code(), Some(exit), "{scenario}");
+        assert_eq!(events.last().unwrap()["data"]["control_outcome"], outcome);
+        assert_eq!(events.last().unwrap()["data"]["blocked_tool_count"], 0);
+        assert_eq!(
+            events.iter().filter(|e| e["kind"] == "agent_event").count(),
+            results
+        );
+        assert!(
+            events
+                .iter()
+                .filter(|e| e["kind"] == "gate_decision")
+                .all(|e| e["data"]["allowed"] == true)
+        );
+    }
+}
+
+#[test]
+fn missing_gate_extension_prevents_the_business_prompt() {
+    let (output, events) = execute("gate-missing", "block", RULES, "test");
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(commands(&events), ["get_commands"]);
+    assert!(
+        !events
+            .iter()
+            .any(|e| e["kind"] == "gate_ready" || e["kind"] == "gate_decision")
+    );
+    assert_eq!(events.last().unwrap()["data"]["control_outcome"], "failed");
+}
+
+#[test]
+fn invalid_gate_correlations_and_unconfirmed_decisions_fail_the_run() {
+    for scenario in [
+        "gate-no-decision",
+        "gate-preflight-error",
+        "gate-unconfirmed",
+        "gate-mismatch",
+        "gate-deny-success",
+        "gate-repeat",
+        "gate-repeat-request",
+    ] {
+        let (output, events) = execute(scenario, "block", RULES, "test");
+        assert_eq!(output.status.code(), Some(2), "{scenario}");
+        assert_eq!(
+            events.last().unwrap()["data"]["control_outcome"],
+            "failed",
+            "{scenario}"
+        );
+    }
+}
+
+#[test]
+fn unrelated_extension_dialog_is_never_automatically_approved() {
+    let (output, events) = execute("gate-foreign-dialog", "block", RULES, "test");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(!events.iter().any(|e| e["kind"] == "gate_decision"));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["kind"] == "rpc_command_written")
+            .count(),
+        2
+    );
+    assert_eq!(events.last().unwrap()["data"]["control_outcome"], "failed");
+}
+
+#[test]
+fn block_requires_gate_and_gate_cannot_be_combined_with_abort() {
+    for (action, gate, message) in [
+        ("block", false, "requires --tool-gate"),
+        ("abort", true, "record or block"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_inhibitor-lab"))
+            .args([
+                "run",
+                "--format",
+                "pi-rpc",
+                "--rules",
+                "unused.json",
+                "--prompt",
+                "test",
+                "--on-trigger",
+                action,
+            ])
+            .args(if gate { &["--tool-gate"][..] } else { &[][..] })
+            .arg("--")
+            .arg(env!("CARGO_BIN_EXE_mock-agent"))
+            .arg("repeat")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(message),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty());
+    }
 }

@@ -6,6 +6,73 @@ fn emit(value: Value) {
     io::stdout().flush().unwrap();
 }
 
+fn gate_mock(scenario: &str) {
+    let mut step = 0;
+    for line in io::stdin().lock().lines() {
+        let command: Value = serde_json::from_str(&line.unwrap()).unwrap();
+        match command["type"].as_str().unwrap() {
+            "get_commands" => {
+                let commands = if scenario == "gate-missing" {
+                    json!([])
+                } else {
+                    json!([{"name":"inhibitor-gate-v1","description":"inhibitor-tool-gate/v1","source":"extension"}])
+                };
+                emit(
+                    json!({"type":"response","id":command["id"],"command":"get_commands","success":true,"data":{"commands":commands}}),
+                );
+                continue;
+            }
+            "prompt" => {
+                emit(
+                    json!({"type":"response","id":command["id"],"command":"prompt","success":true,"data":{"disposition":"started"}}),
+                );
+                emit(json!({"type":"agent_start"}));
+                if matches!(scenario, "gate-no-decision" | "gate-preflight-error") {
+                    emit(
+                        json!({"type":"tool_execution_end","toolCallId":"unadmitted","toolName":"write","isError":scenario == "gate-preflight-error"}),
+                    );
+                    continue;
+                }
+            }
+            "extension_ui_response" => {
+                let allowed = command["confirmed"].as_bool().unwrap();
+                let id = format!("gate-tool-{step}");
+                let name = if step == 2 { "write" } else { "read" };
+                if scenario != "gate-unconfirmed" {
+                    emit(
+                        json!({"type":"extension_ui_request","method":"notify","message":json!({"protocol":"inhibitor-tool-gate/v1","tool_call_id":id,"tool_name":name,"allowed":if scenario == "gate-mismatch" { !allowed } else { allowed }}).to_string()}),
+                    );
+                }
+                emit(
+                    json!({"type":"tool_execution_end","toolCallId":id,"toolName":name,"isError":if scenario == "gate-deny-success" && !allowed { false } else { !allowed || step < 2 }}),
+                );
+                step += 1;
+                if step == 3 || (step == 2 && scenario == "gate-no-next") {
+                    emit(json!({"type":"agent_settled"}));
+                    continue;
+                }
+            }
+            _ => panic!("unexpected gate test command"),
+        }
+        let id = if scenario == "gate-repeat" && step == 1 {
+            "gate-tool-0".to_owned()
+        } else {
+            format!("gate-tool-{step}")
+        };
+        let request_id = if scenario == "gate-repeat-request" {
+            "fixed".to_owned()
+        } else {
+            format!("request-{step}")
+        };
+        emit(
+            json!({"type":"tool_execution_start","toolCallId":id,"toolName":if step == 2 { "write" } else { "read" }}),
+        );
+        emit(
+            json!({"type":"extension_ui_request","method":"confirm","id":request_id,"title":if scenario == "gate-foreign-dialog" { "Another extension asks for approval" } else { "inhibitor-tool-gate/v1" },"message":json!({"tool_call_id":id,"tool_name":if step == 2 { "write" } else { "read" }}).to_string()}),
+        );
+    }
+}
+
 fn rpc(scenario: &str) {
     if scenario == "rpc-no-stdin" {
         std::thread::sleep(std::time::Duration::from_secs(60));
@@ -78,6 +145,7 @@ fn rpc(scenario: &str) {
 
 fn main() {
     match std::env::args().nth(1).as_deref().unwrap_or("repeat") {
+        scenario if scenario.starts_with("gate-") => gate_mock(scenario),
         scenario if scenario.starts_with("rpc-") => rpc(scenario),
         "normal" => {
             println!("INFO starting task");

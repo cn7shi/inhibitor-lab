@@ -1,5 +1,16 @@
 # 决策记录
 
+## D010：沿 RPC 管道执行准入决定，规则保留在 Rust（2026-10-05）
+
+- 选择：自有 Pi 扩展在 `tool_call` 中使用 RPC 的确认请求 / 响应子协议等待 Rust；协议名称固定为 `inhibitor-tool-gate/v1`。Rust 只回应此自有协议，不自动批准其它扩展的交互请求，不要求用户路由到页面。
+- 启动：`--tool-gate` 先查询 `get_commands`，确认扩展注册的版本标记，再发送业务提示。Pi 使用显式扩展路径；CLI 的 `--no-extensions` 仍允许显式路径，并关闭自动发现。
+- 策略：`record` 放行并记录；`block` 在首次规则触发后锁住本次运行的准入，不自动恢复。新请求收到否定后返回 `block: true, terminate: true`；无宿主、超时或信号取消默认拒绝，扩展在本次运行锁住拒绝状态。
+- 证据：Rust 记录决定，扩展通知它实际采用的结果；按工具调用 ID 和名称关联。拒绝决定与确认分开，不把已发送拒绝等同于已经阻止。拒绝生成的合成工具错误单独记录，不进入既有规则计数。
+- 取舍：这使用 Pi 已有 Extension UI 协议作为机器准入通道；不是新的通用认证协议。信任已加载的本地扩展与 Pi 进程，不防御同权限恶意代码或扩展替换。
+- 并发：Pi 可先为同批工具完成全部准备再执行。只保证规则触发后不批准新请求；已批准的工具可能随后才执行，不能凭此承诺“所有尚未开始的调用都被撤销”。嵌套 / 并发专项验证不在首轮验收内。
+- 准入前错误：Pi 对不存在的工具或无效参数可能在调用钩子之前返回失败。当前缺少足以区别“前置校验失败”和“绕过准入执行失败”的结构化证据，因此所有没有匹配准入的结果均保守按协议失败收尾，不凭错误文本猜测。代价是这类模型错误会提前结束运行；后续应补充可靠的前置校验分类。
+- 来源：[扩展契约](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md)、[RPC Extension UI](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc-extension-ui.md)；顺序依据已安装 `pi-agent-core/dist/agent-loop.js`。
+
 ## D009：修复 Windows RPC 退出的运行时条件，保留失败证据（2026-10-05）
 
 - 实测：Node 24.17.0 下真实 Pi 两次中止均返回成功响应和空闲状态，但关闭 stdin 后出现 `UV_HANDLE_CLOSING` 断言，子进程退出码 `-1073740791`；启动器返回 2，最终 `control_outcome: failed`。

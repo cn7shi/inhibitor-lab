@@ -12,9 +12,13 @@ import { stopRun } from "./process-cleanup.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const mode = process.argv[2] ?? "json";
-assert.ok(["json", "rpc-record", "rpc-abort"].includes(mode), "Expected json, rpc-record or rpc-abort");
+assert.ok(["json", "rpc-record", "rpc-abort", "gate-record", "gate-block"].includes(mode), "Unknown experiment mode");
 const rpc = mode !== "json";
 const abort = mode === "rpc-abort";
+const gate = mode.startsWith("gate-");
+const block = mode === "gate-block";
+const action = { json: "record", "rpc-record": "record", "rpc-abort": "abort", "gate-record": "record", "gate-block": "block" }[mode];
+const expectedOutcome = { json: "not_enabled", "rpc-record": "completed", "rpc-abort": "aborted", "gate-record": "completed", "gate-block": "blocked" }[mode];
 const root = resolve(here, "../..");
 const piPackage = join(here, "node_modules/@earendil-works/pi-coding-agent");
 const { version, bin } = JSON.parse(await readFile(join(piPackage, "package.json"), "utf8"));
@@ -45,14 +49,14 @@ const server = createServer(async (request, response) => {
     const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
     assert.equal(body.model, "deterministic");
     assert.equal(body.stream, true);
-    assert.deepEqual(body.tools.map((tool) => tool.function.name), ["read"]);
+    assert.deepEqual(body.tools.map((tool) => tool.function.name).sort(), gate ? ["read", "write"] : ["read"]);
     const results = body.messages.filter((message) => message.role === "tool");
     const step = results.length;
     assert.ok(step <= 3 && requests.length < 5, "Unexpected tool loop or retry");
     requests.push({ step, toolResults: results.length });
     // The record/abort comparison uses the same pause before a third tool call.
     // It isolates cooperative cancellation; it does not prove a zero-latency gate.
-    if (rpc && step === 2) {
+    if (rpc && !gate && step === 2) {
       await new Promise((resolve) => {
         const timer = setTimeout(resolve, 1000);
         response.once("close", () => { clearTimeout(timer); resolve(); });
@@ -67,8 +71,10 @@ const server = createServer(async (request, response) => {
     send({ role: "assistant", content: "" });
     if (step < 3) {
       const path = ["missing-a.txt", "missing-b.txt", "present.txt"][step];
+      const name = gate && step === 2 ? "write" : "read";
+      const args = name === "write" ? { path: "effect.txt", content: "gate-proof\n" } : { path };
       send({ tool_calls: [{ index: 0, id: `lab_read_${step}`, type: "function",
-        function: { name: "read", arguments: JSON.stringify({ path }) } }] });
+        function: { name, arguments: JSON.stringify(args) } }] });
       send({}, "tool_calls");
     } else {
       send({ content: "Local fixture completed: two missing files and one successful read." });
@@ -100,14 +106,17 @@ try {
   await writeFile(join(agentDir, "settings.json"), JSON.stringify({
     retry: { enabled: false }, compaction: { enabled: false },
   }));
-  const prompt = "Read missing-a.txt, missing-b.txt, and present.txt once each, then finish.";
+  const prompt = gate ? "Read missing-a.txt and missing-b.txt, then write effect.txt with gate-proof, then finish."
+    : "Read missing-a.txt, missing-b.txt, and present.txt once each, then finish.";
   const args = ["run", "--format", rpc ? "pi-rpc" : "pi-json", "--rules", join(root, "examples/pi-rules.json"),
     "--out", journal,
-    ...(rpc ? ["--prompt", prompt, "--on-trigger", abort ? "abort" : "record", "--timeout-ms", "20000"] : []),
+    ...(rpc ? ["--prompt", prompt, "--on-trigger", action, "--timeout-ms", "20000"] : []),
+    ...(gate ? ["--tool-gate"] : []),
     "--", process.execPath, join(piPackage, bin.pi),
     "--mode", rpc ? "rpc" : "json", "--provider", "inhibitor-local", "--model", "deterministic",
     "--thinking", "off", "--offline", "--no-extensions", "--no-skills", "--no-prompt-templates",
-    "--no-session", "--tools", "read", ...(rpc ? [] : [prompt])];
+    "--no-session", "--tools", gate ? "read,write" : "read",
+    ...(gate ? ["--extension", join(here, "tool-gate.js")] : []), ...(rpc ? [] : [prompt])];
   const child = spawn(launcher, args, {
     cwd, env: { ...process.env, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1" },
     windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
@@ -118,18 +127,19 @@ try {
     stop: () => stopRun(child, journal),
   });
   assert.deepEqual(serverErrors, [], `Fixture failed; see ${run}`);
-  assert.equal(exitCode, abort ? 3 : 0, `Launcher/Pi failed; see ${join(run, "stderr.log")}`);
+  assert.equal(exitCode, abort || block ? 3 : 0, `Launcher/Pi failed; see ${join(run, "stderr.log")}`);
   if (abort) assert.ok(["0,1", "0,1,2"].includes(requests.map((request) => request.step).join(",")));
+  else if (block) assert.deepEqual(requests.map((request) => request.step), [0, 1, 2]);
   else assert.deepEqual(requests.map((request) => request.step), [0, 1, 2, 3]);
   const events = await readEvents();
   const tools = events.filter((event) => event.kind === "agent_event");
-  assert.deepEqual(tools.map((event) => event.data.event.failed), abort ? [true, true] : [true, true, false]);
-  assert.ok(tools.every((event) => event.data.event.tool_name === "read"));
+  assert.deepEqual(tools.map((event) => event.data.event.failed), abort || block ? [true, true] : [true, true, false]);
+  assert.deepEqual(tools.map((event) => event.data.event.tool_name), gate && !block ? ["read", "read", "write"] : tools.map(() => "read"));
   const triggers = events.filter((event) => event.kind === "rule_triggered");
   assert.equal(triggers.length, 1);
   assert.equal(triggers[0].data.trigger.matched_events, 2);
   assert.equal(triggers[0].data.matched_event_sequence, tools[1].sequence);
-  assert.equal(triggers[0].data.action, abort ? "abort" : "record");
+  assert.equal(triggers[0].data.action, action);
   for (const event of tools) {
     const raw = events.find((candidate) => candidate.sequence === event.data.raw_event_sequence);
     assert.equal(raw.kind, "output");
@@ -138,19 +148,22 @@ try {
     assert.equal(pi.isError, event.data.event.failed);
     assert.equal(pi.toolCallId, event.data.event.tool_call_id);
     if (pi.isError) assert.match(JSON.stringify(pi.result), /ENOENT/);
-    else assert.match(JSON.stringify(pi.result), /ERROR is ordinary file content/);
+    else if (!gate) assert.match(JSON.stringify(pi.result), /ERROR is ordinary file content/);
   }
   assert.equal(events.at(-1).kind, "run_finished");
   assert.equal(events.at(-1).data.adapter_complete, true);
   assert.equal(events.at(-1).data.capture_complete, true);
   assert.equal(events.at(-1).data.exit_code, 0);
   assert.equal(events.at(-1).data.forced_cleanup, false);
-  assert.equal(events.at(-1).data.control_outcome, rpc ? (abort ? "aborted" : "completed") : "not_enabled");
-  if (!abort) assert.ok(tools[2].sequence > triggers[0].sequence, "Pi must continue after a record-only trigger");
+  assert.equal(events.at(-1).data.control_outcome, expectedOutcome);
+  if (!abort && !block) assert.ok(tools[2].sequence > triggers[0].sequence, "Pi must continue after a record-only trigger");
   let confirmation;
   if (rpc) {
     const commands = events.filter((event) => event.kind === "rpc_command_requested");
-    assert.deepEqual(commands.map((event) => event.data.command), abort ? ["prompt", "clear_queue", "abort", "get_state"] : ["prompt"]);
+    let expectedCommands = ["prompt"];
+    if (abort) expectedCommands = ["prompt", "clear_queue", "abort", "get_state"];
+    if (gate) expectedCommands = ["get_commands", "prompt"];
+    assert.deepEqual(commands.map((event) => event.data.command), expectedCommands);
     for (const command of commands) {
       assert.ok(events.some((event) => event.kind === "rpc_response" && event.data.id === command.data.id
         && event.data.command === command.data.command && event.data.success === true));
@@ -166,12 +179,34 @@ try {
       assert.equal(events.filter((event) => event.kind === "tool_started_after_trigger").length, 0);
     }
   }
+  let effectCreated;
+  if (gate) {
+    const decisions = events.filter((event) => event.kind === "gate_decision");
+    const applied = events.filter((event) => event.kind === "gate_applied");
+    assert.deepEqual(decisions.map((event) => event.data.allowed), [true, true, !block]);
+    assert.deepEqual(applied.map((event) => event.data.decision_sequence), decisions.map((event) => event.sequence));
+    assert.deepEqual(applied.map((event) => event.data.allowed), [true, true, !block]);
+    assert.equal(events.at(-1).data.blocked_tool_count, block ? 1 : 0);
+    assert.equal(events.filter((event) => event.kind === "tool_blocked_result").length, block ? 1 : 0);
+    const readiness = events.find((event) => event.kind === "gate_ready");
+    assert.ok(readiness.sequence < events.find((event) => event.kind === "rpc_command_requested" && event.data.command === "prompt").sequence);
+    if (block) {
+      assert.equal(decisions[2].data.trigger_sequence, triggers[0].sequence);
+      await assert.rejects(readFile(join(cwd, "effect.txt")), (error) => error.code === "ENOENT");
+      effectCreated = false;
+    } else {
+      assert.equal(await readFile(join(cwd, "effect.txt"), "utf8"), "gate-proof\n");
+      effectCreated = true;
+    }
+  }
   const summary = {
     pi_version: version, node_version: process.version, model_mode: "local-deterministic-fixture", real_model_validated: false,
     mode, tool_results: tools.length, tool_failures: 2, rule_triggers: 1, exit_code: exitCode,
     child_exit_code: events.at(-1).data.exit_code, control_outcome: events.at(-1).data.control_outcome,
     confirmation_sequence: confirmation?.sequence,
-    tool_starts_after_trigger: events.filter((event) => event.kind === "tool_started_after_trigger").length,
+    tool_starts_after_trigger: rpc ? events.filter((event) => event.kind === "tool_started_after_trigger").length : null,
+    blocked_tool_count: events.at(-1).data.blocked_tool_count,
+    effect_created: effectCreated, artificial_delay_ms: gate ? 0 : undefined,
     raw_output_sequences: tools.map((event) => event.data.raw_event_sequence),
     normalized_sequences: tools.map((event) => event.sequence),
     trigger_sequence: triggers[0].sequence, evidence_sequence: triggers[0].data.matched_event_sequence,

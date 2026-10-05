@@ -2,7 +2,7 @@
 
 本地 Agent 错误治理的独立实验工程，使用 Rust 从头搭建。
 
-当前阶段验证：**启动进程 → 获取输出 → 转换工具结果 → 匹配显式规则 → 记录触发 → 可选 Pi RPC 中止**。
+当前阶段验证：**启动进程 → 获取输出 → 转换工具结果 → 匹配显式规则 → 记录触发 → 可选 Pi RPC 中止或工具准入拦截**。
 
 ## 当前能力
 
@@ -11,12 +11,13 @@
 - 按输出来源、区分大小写的包含字符串和累计命中行数匹配规则。
 - 通过 `--format pi-json` 接收 Pi 事件，将工具结束结果转换为统一事件，按工具报告的成功/失败计数；同一调用 ID 去重。
 - 每条规则在一次运行中最多触发一次，默认记录 `rule_triggered`；显式启用 Pi RPC 中止时，首次触发启动一次控制流程。
+- 显式加载 Pi 工具准入扩展时，每次工具调用等待放行；`block` 动作在规则触发后拒绝新的准入请求。
 - 写入逐行 JSON 事件，保留运行 ID、事件序号、采集时间和触发依据。
 - 观察模式让子进程继续运行并保留其退出码；RPC 模式额外记录控制结果。
 
-规则完全由配置决定；`stderr` 本身不代表错误。当前不判断错误语义。Pi RPC 可在规则触发后请求中止，尚不提供执行前拦截、重试、恢复或上下文修复。
+规则完全由配置决定；`stderr` 本身不代表错误。当前不判断错误语义。Pi RPC 可请求中止，配合自有扩展可关闭新工具准入；已经放行的并发工具不能撤销。尚不提供重试、人工恢复或上下文修复。
 
-开发过程见 [阶段记录](docs/development-log.md)、[决策记录](docs/decisions.md)，证据摘要见 [Pi 本地验证](docs/verification/pi-local.md)、[可靠性自查](docs/verification/self-review.md)、[OCR 委托审查](docs/verification/ocr-delegate.md) 和 [RPC 中止实验](docs/verification/pi-rpc.md)。
+开发过程见 [阶段记录](docs/development-log.md)、[决策记录](docs/decisions.md)，证据摘要见 [Pi 本地验证](docs/verification/pi-local.md)、[可靠性自查](docs/verification/self-review.md)、[OCR 委托审查](docs/verification/ocr-delegate.md)、[RPC 中止实验](docs/verification/pi-rpc.md) 和 [工具准入实验](docs/verification/pi-gate.md)。
 
 ## Pi 本地验证（不需要模型账号）
 
@@ -59,12 +60,35 @@ npm --prefix integrations/pi run check:rpc
 ```
 
 - `--format pi-rpc`：启动器独占子进程 stdin，一次发送一个 `--prompt`。它不是透传交互式会话。
-- `--on-trigger record|abort`：默认 `record`；只有 `abort` 才请求中止。事件规则计数方式不变。
+- `--on-trigger record|abort|block`：默认 `record`；`abort` 请求中止，`block` 需要下面的工具准入扩展。
 - `--timeout-ms`：整个 RPC 实验期限，默认 30000；`--control-timeout-ms`：控制流程及随后关闭进程的各自期限，默认 5000。均接受 1 到 86400000 毫秒。
 - 自然完成须等 `agent_settled`（或提示被直接处理），`agent_end` 本身不够；所有命令响应按 ID 与命令名关联。
 - 正常完成返回子进程退出码；**确认中止且 Pi 正常退出，启动器返回 3**。采集、协议、控制、关闭异常返回 2。超过期限会尝试清理直接子进程，并标记失败；不会把强制清理当作中止成功。
 
 `check:rpc` 会验证启动器的预期退出码 3，因此整个实验脚本成功时仍返回 0，适合在 CI 中运行。
+
+## Pi 工具准入实验
+
+```powershell
+npm --prefix integrations/pi run check:gate
+```
+
+该实验使用真实 Pi 的 `read` / `write` 工具和本机固定模型回复，依次完成两次失败读取，再尝试写入隔离目录里的 `effect.txt`。两组都没有额外等待：仅记录组成功写出文件；拦截组关闭准入，扩展确认拒绝第三次调用，文件不存在，Pi 正常退出。详细证据见 [实验报告](docs/verification/pi-gate.md)。
+
+模型配置完成后的接入形式如下，真实模型联调仍待完成：
+
+```powershell
+.\target\debug\inhibitor-lab.exe run --format pi-rpc --rules examples/pi-rules.json --prompt "读取两个指定的测试文件，然后写入 effect.txt" --tool-gate --on-trigger block -- node integrations/pi/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js --mode rpc --no-session --no-extensions --extension integrations/pi/tool-gate.js --tools read,write
+```
+
+- `--tool-gate` 仅用于 `pi-rpc`，启动时先核对扩展版本标记；缺失时不发送业务提示。仅支持 `record` 或 `block`，不与 `abort` 混用。
+- 扩展在执行前等待 Rust 的明确布尔放行，等待期限为 5 秒；超时、异常、取消或非 RPC 环境默认拒绝。Rust 只回答本项目的准入协议，不自动批准其它扩展的交互请求。
+- 首次触发后，本次运行不再批准新的工具请求；只能开始新运行重置。Pi 收到拒绝会生成一个合成错误结果，该结果单独记录，不计入工具失败规则。
+- `control_outcome: blocked` 表示已有扩展应用拒绝的证据；`gate_closed` 表示准入已关闭，但没有确认拒绝过后续调用。两者在 Pi 正常退出且采集完整时，启动器返回 3；协议或退出异常返回 2。
+- 同批并发工具可能在规则触发前已全部获得放行，即使尚未实际执行也不能撤回。当前是合作式扩展协议，信任本地 Pi 与扩展，不是操作系统沙箱；嵌套与并发专项试验尚未完成。
+- 无效工具名或参数可能在 Pi 准入钩子之前返回错误；当前会因缺少准入证据而结束运行，报告协议失败，不继续按普通工具失败计数。
+
+Pi 的 `tool_execution_start` 出现在准入钩子之前。因此 `tool_started_after_trigger` 只能表示收到了开始事件，不能证明工具已经执行；本实验同时核对准入决定、扩展应用确认和实际文件效果。
 
 ## 运行实验
 
@@ -133,13 +157,15 @@ Pi 适配器仅解析 stdout 中的 `tool_execution_end`，严格要求非空 `t
 
 RPC 增加 `rpc_command_requested`、`rpc_command_written`、`rpc_response`、`rpc_settled`、`control_confirmed`、`rpc_shutdown_requested`、`rpc_input_closed`、`control_failed` 与 `tool_started_after_trigger`。中止命令通过 `trigger_sequence` 关联触发，响应通过 `raw_event_sequence` 关联原始输出。`control_confirmed` 只证明协议中止与空闲状态；最终还须检查 `run_finished` 的退出和完整性信息。
 
-`run_finished.control_outcome` 为 `not_enabled`、`completed`、`aborted` 或 `failed`；`forced_cleanup` 标记是否进入异常清理路径。`completed` 表示本次协议运行结束，不是模型任务质量判断。实际子进程的 `exit_code` / `success` 始终保留，不用启动器的中止退出码 3 覆盖。
+准入模式增加 `gate_ready`、`gate_closed`、`gate_decision`、`gate_applied`、`tool_blocked_result` 和 `gate_error`。决定包含请求 ID、工具调用 ID、工具名、触发依据；应用确认通过 `decision_sequence` 回指决定。`rpc_command_written` 也记录准入回复写入，ID 对应 `gate_decision.request_id`。
+
+`run_finished.control_outcome` 为 `not_enabled`、`completed`、`aborted`、`gate_closed`、`blocked` 或 `failed`；`blocked_tool_count` 为扩展确认应用拒绝的工具数，`forced_cleanup` 标记是否进入异常清理路径。`completed` 表示本次协议运行结束，不是模型任务质量判断。实际子进程的 `exit_code` / `success` 始终保留，不用启动器的受控停止退出码 3 覆盖。
 
 `rule_triggered.data.matched_event_sequence` 指向本次触发对应的输出或统一事件；统一事件的 `data.raw_event_sequence` 再指向原始输出。文本规则记录 `matched_lines`，事件规则记录 `matched_events`。两个流各自保序，跨流序号表示采集顺序；时间戳表示采集时间，不承诺是子进程内的实际发生时间。
 
 每行最多保留 64 KiB，超长部分会被读完并丢弃，事件标记 `truncated: true`，该行不参与规则判断。文本按 UTF-8 解码，无效字节替换为替代字符，同时标记 `invalid_utf8: true`。普通文本模式维持替换解码后的匹配；Pi stdout 中的无效编码行不参与任何规则匹配。终端转发会规范化换行，因此本版本面向文本输出程序。事件队列最多缓存 256 行，写入缓慢时会对采集施加背压。
 
-Pi stdout 的无效 UTF-8、无效 JSON、缺失必填字段、冲突结果或截断记录会生成 `adapter_error`；Pi JSON 观察模式继续采集，结束时 `adapter_complete: false`，启动器返回 2。RPC 模式在协议损坏后进入失败清理，不再据此确认控制成功。`run_finished.exit_code` / `success` 仍描述子进程本身，需同时检查 `capture_complete` 和 `adapter_complete`。大体积工具结果或汇总事件可能超过当前 64 KiB 上限，此时不会宣称采集适配完整。
+Pi stdout 的无效 UTF-8、无效 JSON、缺失必填字段、冲突结果或截断记录会生成 `adapter_error`；Pi JSON 观察模式继续采集，结束时 `adapter_complete: false`，启动器返回 2。RPC 模式在协议损坏后进入失败清理，不再据此确认控制成功；准入模式可能先通过 `gate_error` / `control_failed` 报告无效输入或关联失败。`run_finished.exit_code` / `success` 仍描述子进程本身，需同时检查 `control_outcome`、`capture_complete` 和 `adapter_complete`。大体积工具结果或汇总事件可能超过当前 64 KiB 上限，此时不会宣称采集适配完整。
 
 当前尚未接入本地日志文件跟随、MCP 代理、交互式终端、进程树熔断和人工恢复。观察模式可能等待后台后代关闭继承的输出管道；RPC 异常期限到达后不再无限等待这些读取线程，但不承诺已经停止后代。终端转发和日志仍为同步 I/O，期限不是系统级硬实时保证。
 
@@ -152,12 +178,13 @@ cargo clippy --locked --all-targets -- -D warnings
 npm --prefix integrations/pi test
 npm --prefix integrations/pi run check:local
 npm --prefix integrations/pi run check:rpc
+npm --prefix integrations/pi run check:gate
 ```
 
-24 项 Rust 测试覆盖文本采集、规则、Pi 结果去重、损坏输入、证据关联，以及 RPC 控制、异常响应、超时、退出和竞态记录；9 项 Node 测试检查半条日志下的进程清理、输出写入失败、超时及错误保留。`check:local` 和 `check:rpc` 启动真实 Pi 验证观察及控制链路，Windows CI 执行全部验证。
+30 项 Rust 测试覆盖文本采集、规则、Pi 结果去重、损坏输入、证据关联，以及 RPC 控制、准入确认、异常响应、超时、退出和竞态记录；13 项 Node 测试检查进程清理、输出写入失败、超时、错误保留及扩展拒绝行为。`check:local`、`check:rpc` 和 `check:gate` 启动真实 Pi 验证观察、中止及准入链路，Windows CI 执行全部验证。
 
 ## 后续实验
 
 1. 配置用户选择的模型服务，验证真实模型运行时的事件。
-2. 设计执行前拦截与人工恢复，避免把已验证的 RPC 中止当作硬拦截。
+2. 验证并发和嵌套调用的准入边界，再设计带明确证据的人工恢复。
 3. 增加本地日志来源与 MCP 观测，处理不同来源之间的重复事件。

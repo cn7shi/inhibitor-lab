@@ -25,3 +25,4 @@ jobs:
       - run: cargo +stable build --locked --bins
       - run: npm --prefix integrations/pi run check:local
       - run: npm --prefix integrations/pi run check:rpc
+      - run: npm --prefix integrations/pi run check:gate

@@ -12,9 +12,26 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod control;
-use control::RpcControl;
+mod gate;
+use control::{Action, RpcControl};
 
-const HELP: &str = "inhibitor-lab: capture process output and emit explicit rule triggers\n\nUsage:\n  inhibitor-lab run --rules <rules.json> [--format text|pi-json|pi-rpc] [--out <events.jsonl>] -- <program> [args...]\n\nRPC options (pi-rpc only):\n  --prompt <text>                 Required single prompt sent over stdin\n  --on-trigger record|abort       Default: record\n  --timeout-ms <1..86400000>       Total deadline, default: 30000\n  --control-timeout-ms <1..86400000> Control/shutdown deadline, default: 5000\n\nText and pi-json modes record triggers only. RPC abort clears the queue, requests abort, checks idle state, and closes stdin.\nExit 3 means confirmed RPC abort and clean child exit; exit 2 means capture/adapter/control failure.\nRPC is cooperative cancellation, not an execution-before-use gate or process-tree guarantee.\nLogs default to runs/<run-id>.jsonl. Existing output files are never overwritten.";
+const HELP: &str = r#"inhibitor-lab: capture process output and emit explicit rule triggers
+
+Usage:
+  inhibitor-lab run --rules <rules.json> [--format text|pi-json|pi-rpc] [--out <events.jsonl>] -- <program> [args...]
+
+RPC options (pi-rpc only):
+  --prompt <text>                 Required single prompt sent over stdin
+  --on-trigger record|abort|block Default: record
+  --tool-gate                     Require the explicit Pi tool-gate.js extension
+  --timeout-ms <1..86400000>       Total deadline, default: 30000
+  --control-timeout-ms <1..86400000> Control/shutdown deadline, default: 5000
+
+Text and pi-json modes record triggers only. RPC abort is cooperative cancellation.
+The block action requires --tool-gate. Gated runs support record or block, and check extension readiness before sending a prompt.
+Exit 3 means a clean controlled stop (abort or gate closure); inspect control_outcome and blocked_tool_count for evidence.
+Exit 2 means capture/adapter/control failure. Previously admitted concurrent tools are not revoked by gate closure.
+Logs default to runs/<run-id>.jsonl. Existing output files are never overwritten."#;
 
 struct Options {
     rules: PathBuf,
@@ -22,7 +39,8 @@ struct Options {
     command: Vec<OsString>,
     format: &'static str,
     prompt: Option<String>,
-    abort: bool,
+    action: Action,
+    tool_gate: bool,
     timeout: Duration,
     control_timeout: Duration,
 }
@@ -39,7 +57,8 @@ fn parse_options() -> Result<Option<Options>, String> {
     let mut output = None;
     let mut format = None;
     let mut prompt = None;
-    let mut abort = false;
+    let mut action = Action::Record;
+    let mut tool_gate = false;
     let mut timeout = Duration::from_secs(30);
     let mut control_timeout = Duration::from_secs(5);
     let mut rpc_options = HashSet::new();
@@ -57,9 +76,15 @@ fn parse_options() -> Result<Option<Options>, String> {
                 {
                     return Err("--format pi-rpc requires a nonempty --prompt".into());
                 }
+                if action == Action::Block && !tool_gate {
+                    return Err("--on-trigger block requires --tool-gate".into());
+                }
+                if tool_gate && action == Action::Abort {
+                    return Err("--tool-gate currently supports record or block actions".into());
+                }
             } else if !rpc_options.is_empty() {
                 return Err(
-                    "--prompt, --on-trigger and deadline options require --format pi-rpc".into(),
+                    "--prompt, --on-trigger, --tool-gate and deadline options require --format pi-rpc".into(),
                 );
             }
             return Ok(Some(Options {
@@ -68,10 +93,18 @@ fn parse_options() -> Result<Option<Options>, String> {
                 command,
                 format,
                 prompt,
-                abort,
+                action,
+                tool_gate,
                 timeout,
                 control_timeout,
             }));
+        }
+        if arg == "--tool-gate" {
+            if !rpc_options.insert(arg) {
+                return Err("duplicate option: --tool-gate".into());
+            }
+            tool_gate = true;
+            continue;
         }
         if arg == "--format" {
             if format.is_some() {
@@ -105,10 +138,11 @@ fn parse_options() -> Result<Option<Options>, String> {
             match arg.to_str().unwrap_or_default() {
                 "--prompt" => prompt = Some(value),
                 "--on-trigger" => {
-                    abort = match value.as_str() {
-                        "record" => false,
-                        "abort" => true,
-                        _ => return Err("--on-trigger requires record or abort".into()),
+                    action = match value.as_str() {
+                        "record" => Action::Record,
+                        "abort" => Action::Abort,
+                        "block" => Action::Block,
+                        _ => return Err("--on-trigger requires record, abort or block".into()),
                     }
                 }
                 _ => {
@@ -182,14 +216,9 @@ fn record_triggers(
 ) -> io::Result<usize> {
     let count = triggers.len();
     for trigger in triggers {
-        let action = if control
+        let action = control
             .as_ref()
-            .is_some_and(|control| control.abort_on_trigger)
-        {
-            "abort"
-        } else {
-            "record"
-        };
+            .map_or("record", |control| control.action.label());
         let trigger_sequence = journal.emit(
             "rule_triggered",
             json!({"trigger": trigger, "matched_event_sequence": sequence, "action": action}),
@@ -310,7 +339,8 @@ fn run(options: Options) -> Result<i32, Box<dyn std::error::Error>> {
             sender.clone(),
             options.timeout,
             options.control_timeout,
-            options.abort,
+            options.action,
+            options.tool_gate,
         ))
     } else {
         None
@@ -399,6 +429,25 @@ fn run(options: Options) -> Result<i32, Box<dyn std::error::Error>> {
                     }
                     continue;
                 }
+                if source == Source::Stdout
+                    && let Some(control) = &control
+                {
+                    match control.blocked_result(&text) {
+                        Ok(true) => {
+                            journal.emit("tool_blocked_result", json!({"raw_event_sequence": sequence, "counted_as_tool_failure": false}))?;
+                            continue;
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            control_failure = Some(error.to_string());
+                            journal.emit(
+                                "gate_error",
+                                json!({"raw_event_sequence": sequence, "error": error.to_string()}),
+                            )?;
+                            continue;
+                        }
+                    }
+                }
                 trigger_count += record_triggers(
                     &mut journal,
                     rules.observe(source, &text),
@@ -483,23 +532,37 @@ fn run(options: Options) -> Result<i32, Box<dyn std::error::Error>> {
         }
     }
     let aborted = control.as_ref().is_some_and(|control| control.confirmed);
+    let gate_closed = control
+        .as_ref()
+        .and_then(|control| control.gate.as_ref())
+        .is_some_and(|gate| gate.closed_by.is_some());
+    let blocked_count = control
+        .as_ref()
+        .and_then(|control| control.gate.as_ref())
+        .map_or(0, |gate| gate.blocked_count);
     let control_outcome = if control.is_none() {
         "not_enabled"
     } else if control_failure.is_some() || !status.success() {
         "failed"
     } else if aborted {
         "aborted"
+    } else if gate_closed {
+        if blocked_count > 0 {
+            "blocked"
+        } else {
+            "gate_closed"
+        }
     } else {
         "completed"
     };
-    journal.emit("run_finished", json!({"exit_code": status.code(), "success": status.success(), "trigger_count": trigger_count, "capture_complete": !capture_failed, "adapter_complete": adapter_complete, "control_outcome": control_outcome, "forced_cleanup": forced_cleanup}))?;
+    journal.emit("run_finished", json!({"exit_code": status.code(), "success": status.success(), "trigger_count": trigger_count, "capture_complete": !capture_failed, "adapter_complete": adapter_complete, "control_outcome": control_outcome, "forced_cleanup": forced_cleanup, "blocked_tool_count": blocked_count}))?;
     if !adapter_complete {
         eprintln!("[inhibitor-lab] Pi input was incomplete or invalid; see adapter_error events");
     }
     Ok(
         if capture_failed || !adapter_complete || control_outcome == "failed" {
             2
-        } else if aborted {
+        } else if aborted || gate_closed {
             3
         } else {
             status.code().unwrap_or(1)

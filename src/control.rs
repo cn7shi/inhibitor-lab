@@ -1,3 +1,4 @@
+use crate::gate::{self, ToolGate};
 use crate::{Capture, Journal};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -7,13 +8,32 @@ use std::sync::mpsc::{SyncSender, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    Record,
+    Abort,
+    Block,
+}
+
+impl Action {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Record => "record",
+            Self::Abort => "abort",
+            Self::Block => "block",
+        }
+    }
+}
+
 pub struct RpcControl {
     writer: Option<SyncSender<Value>>,
     pending: HashMap<String, String>,
     deadline: Instant,
     phase_deadline: Option<Instant>,
     grace: Duration,
-    pub abort_on_trigger: bool,
+    pub action: Action,
+    pub gate: Option<ToolGate>,
+    pending_prompt: Option<String>,
     pub trigger_sequence: Option<u64>,
     first_trigger_sequence: Option<u64>,
     pub confirmed: bool,
@@ -28,7 +48,8 @@ impl RpcControl {
         sender: SyncSender<Capture>,
         timeout: Duration,
         grace: Duration,
-        abort_on_trigger: bool,
+        action: Action,
+        tool_gate: bool,
     ) -> Self {
         let (writer, commands) = sync_channel::<Value>(4);
         thread::spawn(move || {
@@ -58,7 +79,9 @@ impl RpcControl {
             deadline: Instant::now() + timeout,
             phase_deadline: None,
             grace,
-            abort_on_trigger,
+            action,
+            gate: tool_gate.then(ToolGate::default),
+            pending_prompt: None,
             trigger_sequence: None,
             first_trigger_sequence: None,
             confirmed: false,
@@ -93,12 +116,24 @@ impl RpcControl {
     }
 
     pub fn prompt(&mut self, message: &str, journal: &mut Journal) -> io::Result<()> {
-        self.send("prompt", Some(message), journal)
+        if self.gate.is_some() {
+            self.pending_prompt = Some(message.to_owned());
+            self.send("get_commands", None, journal)
+        } else {
+            self.send("prompt", Some(message), journal)
+        }
     }
 
     pub fn trigger(&mut self, sequence: u64, journal: &mut Journal) -> io::Result<()> {
         self.first_trigger_sequence.get_or_insert(sequence);
-        if !self.abort_on_trigger || self.trigger_sequence.is_some() {
+        if self.action == Action::Block {
+            return self
+                .gate
+                .as_mut()
+                .ok_or_else(|| io::Error::other("block action requires tool gate"))?
+                .close(sequence, journal);
+        }
+        if self.action != Action::Abort || self.trigger_sequence.is_some() {
             return Ok(());
         }
         if self.closing {
@@ -111,8 +146,22 @@ impl RpcControl {
 
     pub fn observe(&mut self, text: &str, sequence: u64, journal: &mut Journal) -> io::Result<()> {
         let value: Value = serde_json::from_str(text)?;
+        if let Some(gate) = &mut self.gate {
+            if let Some(response) = gate.observe(&value, sequence, journal)? {
+                self.writer
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("gate response after RPC input closed"))?
+                    .try_send(response)
+                    .map_err(io::Error::other)?;
+            }
+        } else if value["type"] == "extension_ui_request" && value["title"] == gate::PROTOCOL {
+            return Err(io::Error::other("gate extension requires --tool-gate"));
+        }
         match value["type"].as_str() {
             Some("agent_start" | "tool_execution_start") => {
+                if self.gate.as_ref().is_some_and(|gate| !gate.ready) {
+                    return Err(io::Error::other("Pi started work before gate readiness"));
+                }
                 if self.closing {
                     return Err(io::Error::other(
                         "Pi started work after idle/shutdown confirmation",
@@ -143,6 +192,36 @@ impl RpcControl {
                     )));
                 }
                 match command.as_str() {
+                    "get_commands" => {
+                        let present =
+                            value["data"]["commands"]
+                                .as_array()
+                                .is_some_and(|commands| {
+                                    commands.iter().any(|command| {
+                                        command["name"] == gate::COMMAND
+                                            && command["description"] == gate::PROTOCOL
+                                            && command["source"] == "extension"
+                                    })
+                                });
+                        if !present {
+                            return Err(io::Error::other(
+                                "required tool gate extension is missing or incompatible; no prompt sent",
+                            ));
+                        }
+                        self.gate
+                            .as_mut()
+                            .ok_or_else(|| io::Error::other("unexpected gate readiness response"))?
+                            .ready = true;
+                        journal.emit(
+                            "gate_ready",
+                            json!({"protocol": gate::PROTOCOL, "raw_event_sequence": sequence}),
+                        )?;
+                        let message = self
+                            .pending_prompt
+                            .take()
+                            .ok_or_else(|| io::Error::other("missing gated prompt"))?;
+                        self.send("prompt", Some(&message), journal)?;
+                    }
                     "prompt" => {
                         match value["data"]["disposition"].as_str() {
                             Some("started") => {}
@@ -184,6 +263,11 @@ impl RpcControl {
                 self.settled
             }
         {
+            if self.gate.as_ref().is_some_and(|gate| !gate.complete()) {
+                return Err(io::Error::other(
+                    "Pi settled with unconfirmed gate decisions",
+                ));
+            }
             journal.emit("rpc_shutdown_requested", json!({"reason": if self.confirmed { "abort_confirmed" } else { "agent_settled_or_prompt_handled" }}))?;
             self.writer.take();
             self.closing = true;
@@ -195,5 +279,12 @@ impl RpcControl {
     pub fn expired(&self) -> bool {
         let now = Instant::now();
         now >= self.deadline || self.phase_deadline.is_some_and(|deadline| now >= deadline)
+    }
+
+    pub fn blocked_result(&self, text: &str) -> io::Result<bool> {
+        match &self.gate {
+            Some(gate) => gate.blocked_result(&serde_json::from_str(text)?),
+            None => Ok(false),
+        }
     }
 }
