@@ -15,6 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const CONFIG_LIMIT: u64 = 1024 * 1024;
 const PLAN_LIMIT: u64 = 2 * 1024 * 1024;
 type Check<T> = Result<T, String>;
+mod status;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -280,7 +281,7 @@ fn prepare(parent: &Path, config: &Path, output: &Path) -> Check<i32> {
     Ok(0)
 }
 
-fn verify(plan: &Plan, path: &Path) -> Check<()> {
+fn verify_plan(plan: &Plan, path: &Path) -> Check<()> {
     require(
         plan.schema_version == 1 && plan.kind == "recovery_plan" && plan.policy == policy(),
         "计划版本、类型或控制策略无效",
@@ -300,10 +301,40 @@ fn verify(plan: &Plan, path: &Path) -> Check<()> {
             && plan.planned_run_id == format!("{}-child", plan.recovery_id),
         "无效恢复或预留运行 ID",
     )?;
+    Ok(())
+}
+
+fn verify(plan: &Plan, path: &Path) -> Check<()> {
+    verify_plan(plan, path)?;
     require(
         inputs(&plan.inputs.parent_log, &plan.inputs.config_path)? == plan.inputs,
         "父日志、新配置、路径或规则与计划不同，请重新准备并确认",
     )
+}
+
+fn verified_confirmation(
+    bytes: &[u8],
+    plan: &Plan,
+    path: &Path,
+    plan_sha256: &str,
+) -> Check<Confirmation> {
+    let receipt: Confirmation =
+        serde_json::from_slice(bytes).map_err(|_| "缺少有效的明确确认记录")?;
+    require(
+        receipt.schema_version == 1
+            && receipt.kind == "recovery_confirmation"
+            && receipt.status == "confirmed_not_started"
+            && receipt.recovery_id == plan.recovery_id
+            && receipt.planned_run_id == plan.planned_run_id
+            && receipt.parent_run_id == plan.inputs.parent.run_id
+            && receipt.parent_sha256 == plan.inputs.parent.sha256
+            && receipt.config_sha256 == plan.inputs.config_sha256
+            && receipt.rules_sha256 == plan.inputs.rules_sha256
+            && receipt.plan_path == path
+            && receipt.plan_sha256 == plan_sha256,
+        "确认记录与已审阅计划不一致，请重新准备并确认",
+    )?;
+    Ok(receipt)
 }
 
 fn confirm(path: &Path, input: &mut impl BufRead, output: &mut impl Write) -> Check<i32> {
@@ -377,22 +408,7 @@ fn start(path: &Path) -> Check<i32> {
     verify(&plan, &path)?;
     let plan_sha256 = digest(&bytes);
     let receipt_bytes = read(&receipt_path(&path), 64 * 1024)?;
-    let receipt: Confirmation =
-        serde_json::from_slice(&receipt_bytes).map_err(|_| "缺少有效的明确确认记录")?;
-    require(
-        receipt.schema_version == 1
-            && receipt.kind == "recovery_confirmation"
-            && receipt.status == "confirmed_not_started"
-            && receipt.recovery_id == plan.recovery_id
-            && receipt.planned_run_id == plan.planned_run_id
-            && receipt.parent_run_id == plan.inputs.parent.run_id
-            && receipt.parent_sha256 == plan.inputs.parent.sha256
-            && receipt.config_sha256 == plan.inputs.config_sha256
-            && receipt.rules_sha256 == plan.inputs.rules_sha256
-            && receipt.plan_path == path
-            && receipt.plan_sha256 == plan_sha256,
-        "确认记录与已审阅计划不一致，请重新准备并确认",
-    )?;
+    let receipt = verified_confirmation(&receipt_bytes, &plan, &path, &plan_sha256)?;
     let confirmation_sha256 = digest(&receipt_bytes);
     // Build the engine from the verified snapshot, never reopen a mutable rule path in execute.
     let rules = RuleEngine::from_json(&plan.inputs.rules_snapshot.to_string())
@@ -483,13 +499,16 @@ fn start(path: &Path) -> Check<i32> {
 pub fn command(mut args: impl Iterator<Item = OsString>) -> Check<i32> {
     let mode = args
         .next()
-        .ok_or("recovery 需要 prepare、confirm 或 start")?;
+        .ok_or("recovery 需要 prepare、confirm、start 或 status")?;
+    if mode == "status" {
+        return status::command(args);
+    }
     let allowed: &[&str] = if mode == "prepare" {
         &["--parent", "--config", "--out"]
     } else if mode == "confirm" || mode == "start" {
         &["--plan"]
     } else {
-        return Err("recovery 只支持 prepare、confirm 或 start".into());
+        return Err("recovery 只支持 prepare、confirm、start 或 status".into());
     };
     let mut options = HashMap::new();
     while let Some(arg) = args.next() {

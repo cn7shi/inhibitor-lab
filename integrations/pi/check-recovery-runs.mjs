@@ -1,4 +1,4 @@
-// R4: real Pi A -> explicit confirmation -> real Pi B, driven by local fixed replies.
+// R4/R5: real Pi A -> confirmation -> real Pi B, plus read-only status, using local fixed replies.
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -8,7 +8,7 @@ import { createServer } from "node:http";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { captureOutput } from "./capture-output.mjs";
-import { checkRecovery } from "./check-recovery.mjs";
+import { checkRecovery, recoveryStatus } from "./check-recovery.mjs";
 import { stopRun } from "./process-cleanup.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -106,6 +106,8 @@ async function runCase(scenario) {
   const requests = { parent: [], child: [] };
   const serverErrors = [];
   let phase = null;
+  let activePlan = null;
+  let liveStatus = null;
   const server = createServer(async (request, response) => {
     try {
       const current = phase;
@@ -133,6 +135,11 @@ async function runCase(scenario) {
       assert.deepEqual(results.map((m) => m.tool_call_id),
         Array.from({ length: step }, (_, index) => `recovery_tool_${index}`));
       requests[current].push({ step, transcript_tool_results: step, user_messages: users.length });
+      if (current === "child" && step === 0) {
+        // Pi is waiting for this reply: only read evidence; do not drive its protocol here.
+        liveStatus = recoveryStatus(launcher, activePlan, "outcome_unknown", 2);
+        assert.equal(liveStatus.start_record_observed, true);
+      }
       response.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
       const send = (delta, finishReason = null) => response.write(`data: ${JSON.stringify({
         id: `recovery-fixture-${step}`, object: "chat.completion.chunk", created: 0, model: "deterministic",
@@ -227,6 +234,7 @@ async function runCase(scenario) {
       await save(join(reviewDir, "stale-attempt.json"), { launcher_exit: staleExit,
         start_record_created: false, child_log_created: false, model_requests: 0, confirmation_unchanged: true });
       staleStartRejected = true;
+      await save(join(reviewDir, "stale-status.json"), recoveryStatus(launcher, planPath, "stale_inputs", 2));
       const freshDir = join(run, "review-fresh");
       await mkdir(freshDir);
       await save(join(freshDir, "review-summary.json"), await checkRecovery(launcher, parentLog, freshDir, config));
@@ -237,6 +245,7 @@ async function runCase(scenario) {
     const planBytes = await readFile(planPath), receiptBytes = await readFile(`${planPath}.confirmed.json`);
     const plan = JSON.parse(planBytes), receipt = JSON.parse(receiptBytes);
     const childLog = `${planPath}.run.jsonl`;
+    activePlan = planPath;
     phase = "child";
     const childExit = await execute(["recovery", "start", "--plan", planPath], childLog, "child", childEnv);
     phase = null;
@@ -286,6 +295,11 @@ async function runCase(scenario) {
     const paths = [parentLog, planPath, `${planPath}.confirmed.json`, `${planPath}.start.json`, childLog, `${planPath}.result.json`];
     const snapshots = await Promise.all(paths.map((path) => readFile(path)));
     const requestSnapshot = JSON.stringify(requests);
+    const finalStatus = recoveryStatus(launcher, planPath, blocked ? "blocked" : "completed");
+    assert.deepEqual(finalStatus.finish, child.finish);
+    assert.equal(finalStatus.source_check, "matches");
+    await save(join(run, "live-status.json"), liveStatus);
+    await save(join(run, "final-status.json"), finalStatus);
     const replayExit = await execute(["recovery", "start", "--plan", planPath], childLog, "replay", childEnv);
     assert.equal(replayExit, 2);
     assert.deepEqual(await Promise.all(paths.map((path) => readFile(path))), snapshots);

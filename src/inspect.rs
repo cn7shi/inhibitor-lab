@@ -114,6 +114,11 @@ fn raw(events: &[Event], at: usize, data: &Value) -> Check<Value> {
 
 fn load(path: &Path) -> Check<(Vec<Event>, String)> {
     let bytes = crate::evidence_file::read(path, MAX_BYTES)?;
+    Ok((decode(&bytes)?, crate::evidence_file::digest(&bytes)))
+}
+
+fn decode(bytes: &[u8]) -> Check<Vec<Event>> {
+    require(bytes.len() as u64 <= MAX_BYTES, "日志超过 32 MiB 上限")?;
     require(!bytes.is_empty(), "日志为空")?;
     require(
         bytes.last() == Some(&b'\n'),
@@ -142,7 +147,62 @@ fn load(path: &Path) -> Check<(Vec<Event>, String)> {
         let _ = event.at_unix_ms;
         events.push(event);
     }
-    Ok((events, crate::evidence_file::digest(&bytes)))
+    Ok(events)
+}
+
+pub(super) struct ChildEvidence {
+    pub run_id: String,
+    pub program: String,
+    pub pid: Option<u32>,
+    pub linkage: Option<Value>,
+    pub finish: Option<Value>,
+    pub spawn_error: Option<String>,
+}
+
+/// Diagnose exactly the bytes held by the caller. Prefix mode proves only the startup/link.
+pub(super) fn recovery_child(bytes: &[u8], complete: bool) -> Check<ChildEvidence> {
+    let length = if complete {
+        bytes.len()
+    } else {
+        bytes
+            .split_inclusive(|b| *b == b'\n')
+            .take(2)
+            .map(<[u8]>::len)
+            .sum()
+    };
+    let events = decode(&bytes[..length])?;
+    let first = &events[0];
+    let mut report = Report::default();
+    if complete {
+        validate(&events, &mut report)?;
+        require(report.status == "valid", "子日志缺少完整终态")?;
+    }
+    let program = string(&first.data, "program")?.to_owned();
+    let (pid, spawn_error) = if first.kind == "spawn_failed" && complete {
+        (None, Some(string(&first.data, "error")?.to_owned()))
+    } else {
+        require(
+            first.kind == "run_started" && first.data["format"] == "pi-rpc",
+            "子日志启动类型无效",
+        )?;
+        let pid: u32 = number(&first.data, "pid")?
+            .try_into()
+            .map_err(|_| "子 PID 超出范围")?;
+        require(pid > 0, "子 PID 无效")?;
+        let linked = events.get(1).ok_or("子日志缺少关联")?;
+        require(linked.kind == "run_linked", "子日志第二条不是关联")?;
+        crate::recovery::validate_link(&linked.data, &first.run_id)?;
+        report.linkage = Some(linked.data.clone());
+        (Some(pid), None)
+    };
+    Ok(ChildEvidence {
+        run_id: first.run_id.clone(),
+        program,
+        pid,
+        linkage: report.linkage,
+        finish: report.finish,
+        spawn_error,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -628,6 +688,25 @@ fn validate(events: &[Event], report: &mut Report) -> Check<()> {
                         "未知控制终态",
                     )?;
                     report.finish = Some(d.clone());
+                    if outcome == "completed" {
+                        require(
+                            format == "pi-rpc"
+                                && success
+                                && complete
+                                && !forced
+                                && !unhealthy
+                                && !abort_confirmed
+                                && closed_by.is_none()
+                                && prompt_accepted
+                                && settled
+                                && shutdown
+                                && input_closed
+                                && decisions.values().all(|d| d.applied)
+                                && commands.len() == responses.len()
+                                && (report.linkage.is_none() || gate_ready),
+                            "声称正常完成的终态缺少完整 RPC 收尾或恢复门禁证据",
+                        )?;
+                    }
                     if matches!(outcome, "blocked" | "gate_closed") {
                         require(
                             format == "pi-rpc"

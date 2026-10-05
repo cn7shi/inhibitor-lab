@@ -172,6 +172,307 @@ fn start_command(path: &Path) -> Command {
     command
 }
 
+fn status_json(path: &Path, state: &str, code: i32) -> Value {
+    let output = Command::new(BIN)
+        .args(["recovery", "status", "--plan"])
+        .arg(path)
+        .args(["--format", "json"])
+        .output()
+        .unwrap();
+    expect_code(&output, code);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["state"], state, "{report}");
+    assert_eq!(report["read_only"], true);
+    assert_eq!(report["authorizes_start"], false);
+    report
+}
+
+fn evidence_bytes(fixture: &Fixture) -> Vec<Option<Vec<u8>>> {
+    [
+        fixture.plan.clone(),
+        fixture.receipt.clone(),
+        fixture.parent.clone(),
+        fixture.config.clone(),
+        fixture.rules.clone(),
+        fixture.sidecar(".start.json"),
+        fixture.sidecar(".run.jsonl"),
+        fixture.sidecar(".result.json"),
+    ]
+    .iter()
+    .map(|path| fs::read(path).ok())
+    .collect()
+}
+
+#[test]
+fn status_tracks_pending_stages_without_mutating_or_starting() {
+    let f = Fixture::new();
+    f.prepared();
+    let before = evidence_bytes(&f);
+    let report = status_json(&f.plan, "awaiting_confirmation", 0);
+    assert_eq!(report["source_check"], "matches");
+    assert_eq!(report["start_record_observed"], false);
+    assert_eq!(before, evidence_bytes(&f));
+    expect_code(&f.confirm(b"cancel\n"), 3);
+    status_json(&f.plan, "awaiting_confirmation", 0);
+    expect_code(&f.confirm(f.token().as_bytes()), 0);
+    let before = evidence_bytes(&f);
+    status_json(&f.plan, "awaiting_start", 0);
+    assert_eq!(before, evidence_bytes(&f));
+    f.unchanged();
+    f.no_start();
+}
+
+#[test]
+fn status_distinguishes_complete_blocked_and_closed_runs_read_only() {
+    for (scenario, code, state) in [
+        ("gate-success", 0, "completed"),
+        ("gate-block", 3, "blocked"),
+        ("gate-no-next", 3, "blocked"),
+    ] {
+        let f = Fixture::new();
+        f.start_setup(scenario);
+        expect_code(&f.start(), code);
+        let before = evidence_bytes(&f);
+        let report = status_json(&f.plan, state, 0);
+        assert_eq!(report["start_record_observed"], true);
+        assert_eq!(
+            report["finish"],
+            read_json(&f.sidecar(".result.json"))["finish"]
+        );
+        assert_eq!(before, evidence_bytes(&f));
+    }
+}
+
+#[test]
+fn status_separates_current_source_changes_from_historical_completion() {
+    for started in [false, true] {
+        let f = Fixture::new();
+        f.start_setup("gate-success");
+        if started {
+            expect_code(&f.start(), 0);
+        }
+        fs::remove_file(&f.config).unwrap();
+        let before = evidence_bytes(&f);
+        let report = status_json(
+            &f.plan,
+            if started { "completed" } else { "stale_inputs" },
+            if started { 0 } else { 2 },
+        );
+        assert_eq!(report["source_check"], "changed_or_unavailable");
+        assert_eq!(before, evidence_bytes(&f));
+    }
+}
+
+#[test]
+fn status_never_promotes_missing_or_partial_start_results_to_success() {
+    for damaged in [
+        "claim",
+        "result",
+        "missing-result",
+        "missing-result-and-journal",
+    ] {
+        let f = Fixture::new();
+        f.start_setup("gate-success");
+        expect_code(&f.start(), 0);
+        match damaged {
+            "claim" => fs::write(f.sidecar(".start.json"), b"{").unwrap(),
+            "result" => fs::write(f.sidecar(".result.json"), b"{").unwrap(),
+            _ => {
+                fs::remove_file(f.sidecar(".result.json")).unwrap();
+                if damaged.ends_with("and-journal") {
+                    fs::remove_file(f.sidecar(".run.jsonl")).unwrap();
+                }
+            }
+        }
+        let before = evidence_bytes(&f);
+        let report = status_json(&f.plan, "outcome_unknown", 2);
+        assert_eq!(report["start_record_observed"], true);
+        assert!(report["finish"].is_null());
+        assert_eq!(before, evidence_bytes(&f));
+        expect_code(&f.start(), 2);
+    }
+}
+
+#[test]
+fn status_rejects_completion_without_rpc_proof() {
+    let f = Fixture::new();
+    f.start_setup("gate-success");
+    expect_code(&f.start(), 0);
+    let events = f.child_events();
+    let mut finish = events.last().unwrap().clone();
+    finish["sequence"] = json!(3);
+    fs::write(
+        f.sidecar(".run.jsonl"),
+        format!("{}\n{}\n{finish}\n", events[0], events[1]),
+    )
+    .unwrap();
+    status_json(&f.plan, "invalid_evidence", 2);
+}
+
+#[test]
+fn status_rejects_mixed_identities_hashes_paths_pids_and_terminal_claims() {
+    for defect in [
+        "receipt",
+        "claim-path",
+        "claim-parent",
+        "result-hash",
+        "result-id",
+        "result-pid",
+        "result-exit",
+        "finish",
+        "missing-claim",
+        "missing-receipt",
+        "child-link",
+    ] {
+        let f = Fixture::new();
+        f.start_setup("gate-success");
+        expect_code(&f.start(), 0);
+        match defect {
+            "receipt" => update_json(&f.receipt, |v| v["parent_run_id"] = json!("other")),
+            "claim-path" => update_json(&f.sidecar(".start.json"), |v| {
+                v["output_path"] = json!(f.parent)
+            }),
+            "claim-parent" => update_json(&f.sidecar(".start.json"), |v| {
+                v["parent_run_id"] = json!("other")
+            }),
+            "result-hash" => update_json(&f.sidecar(".result.json"), |v| {
+                v["start_sha256"] = json!("0".repeat(64))
+            }),
+            "result-id" => {
+                update_json(&f.sidecar(".result.json"), |v| v["run_id"] = json!("other"))
+            }
+            "result-pid" => update_json(&f.sidecar(".result.json"), |v| v["pid"] = json!(1)),
+            "result-exit" => update_json(&f.sidecar(".result.json"), |v| {
+                v["launcher_exit_code"] = json!(3)
+            }),
+            "finish" => update_json(&f.sidecar(".result.json"), |v| {
+                v["finish"]["trigger_count"] = json!(77)
+            }),
+            "missing-claim" => fs::remove_file(f.sidecar(".start.json")).unwrap(),
+            "missing-receipt" => fs::remove_file(&f.receipt).unwrap(),
+            "child-link" => {
+                let mut events = f.child_events();
+                events[1]["data"]["parent_sha256"] = json!("0".repeat(64));
+                fs::write(
+                    f.sidecar(".run.jsonl"),
+                    events.iter().map(|e| format!("{e}\n")).collect::<String>(),
+                )
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let before = evidence_bytes(&f);
+        status_json(&f.plan, "invalid_evidence", 2);
+        assert_eq!(before, evidence_bytes(&f));
+    }
+}
+
+#[test]
+fn status_reports_actual_spawn_control_and_output_failures() {
+    for failure in ["spawn", "control", "output"] {
+        let f = Fixture::new();
+        if failure == "spawn" {
+            let program = f.root.join("not-executable.txt");
+            fs::write(&program, b"not a program").unwrap();
+            update_json(&f.config, |v| v["program"] = json!(program));
+            f.prepared();
+            expect_code(&f.confirm(f.token().as_bytes()), 0);
+        } else {
+            f.start_setup(if failure == "control" {
+                "gate-missing"
+            } else {
+                "gate-success"
+            });
+        }
+        if failure == "output" {
+            let mut child = start_command(&f.plan).spawn().unwrap();
+            drop(child.stdout.take());
+            expect_code(&child.wait_with_output().unwrap(), 2);
+        } else {
+            expect_code(&f.start(), 2);
+        }
+        let before = evidence_bytes(&f);
+        let report = status_json(&f.plan, "failed", 0);
+        assert_eq!(
+            report["result_status"],
+            read_json(&f.sidecar(".result.json"))["status"]
+        );
+        assert_eq!(before, evidence_bytes(&f));
+    }
+}
+
+#[test]
+fn status_validates_not_spawned_evidence_and_rejects_conflicting_child_bytes() {
+    let f = Fixture::new();
+    let program = f.root.join("not-executable.txt");
+    fs::write(&program, b"not a program").unwrap();
+    update_json(&f.config, |v| v["program"] = json!(program));
+    f.prepared();
+    expect_code(&f.confirm(f.token().as_bytes()), 0);
+    expect_code(&f.start(), 2);
+    // Synthetic post-claim/pre-spawn failure evidence, not crash or race injection.
+    update_json(&f.sidecar(".result.json"), |v| {
+        v["status"] = json!("not_spawned")
+    });
+    fs::remove_file(f.sidecar(".run.jsonl")).unwrap();
+    let before = evidence_bytes(&f);
+    status_json(&f.plan, "failed", 0);
+    assert_eq!(before, evidence_bytes(&f));
+    fs::write(f.sidecar(".run.jsonl"), b"conflicting execution record\n").unwrap();
+    status_json(&f.plan, "invalid_evidence", 2);
+}
+
+#[test]
+fn status_handles_missing_malformed_oversized_and_copied_records_without_writes() {
+    let f = Fixture::new();
+    status_json(&f.plan, "invalid_evidence", 2);
+    f.no_start();
+    f.prepared();
+    let copied = f.root.join("copy.json");
+    fs::copy(&f.plan, &copied).unwrap();
+    status_json(&copied, "invalid_evidence", 2);
+    fs::write(&f.receipt, b"{").unwrap();
+    status_json(&f.plan, "invalid_evidence", 2);
+    fs::write(&f.receipt, vec![b' '; 65537]).unwrap();
+    status_json(&f.plan, "invalid_evidence", 2);
+    fs::write(&f.plan, vec![b' '; 2 * 1024 * 1024 + 1]).unwrap();
+    status_json(&f.plan, "invalid_evidence", 2);
+    assert!(!f.sidecar(".start.json").exists());
+    assert!(!f.sidecar(".run.jsonl").exists());
+}
+
+#[test]
+fn status_text_and_cli_contract_are_read_only_and_unambiguous() {
+    let f = Fixture::new();
+    f.prepared();
+    let output = Command::new(BIN)
+        .args(["recovery", "status", "--plan"])
+        .arg(&f.plan)
+        .output()
+        .unwrap();
+    expect_code(&output, 0);
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("待确认") && text.contains("不签发启动许可"));
+    for args in [
+        vec![],
+        vec!["--format", "xml"],
+        vec!["--plan"],
+        vec!["--start"],
+        vec!["--format", "json", "--format", "text"],
+    ] {
+        expect_code(
+            &Command::new(BIN)
+                .args(["recovery", "status"])
+                .args(args)
+                .output()
+                .unwrap(),
+            2,
+        );
+    }
+    f.unchanged();
+    f.no_start();
+}
+
 impl Fixture {
     fn start_setup(&self, scenario: &str) -> Value {
         update_json(&self.config, |value| {

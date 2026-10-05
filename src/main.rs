@@ -26,6 +26,7 @@ Usage:
   inhibitor-lab recovery prepare --parent <events.jsonl> --config <new-run.json> --out <plan.json>
   inhibitor-lab recovery confirm --plan <plan.json>
   inhibitor-lab recovery start --plan <plan.json>
+  inhibitor-lab recovery status --plan <plan.json> [--format text|json]
 
 Inspect is read-only. Exit 0 means a valid diagnostic, not permission to restart.
 Invalid/incomplete/unsupported logs return 2.
@@ -34,6 +35,8 @@ Recovery exit 0 means saved, 3 means cancelled, 2 means invalid, changed, or alr
 Recovery start consumes a confirmed plan once; exit 0 means completed, 3 means controlled stop,
 2 means failure or rejected start. It writes .start.json, .run.jsonl and .result.json beside the plan.
 An existing start record prevents retry even when the outcome is unknown.
+Recovery status is read-only and never authorizes a start. Exit 0 means a determinate report,
+including known failure; exit 2 means unknown outcome, stale inputs or invalid evidence.
 
 RPC options (pi-rpc only):
   --prompt <text>                 Required single prompt sent over stdin
